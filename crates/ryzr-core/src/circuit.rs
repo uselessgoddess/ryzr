@@ -44,9 +44,6 @@ pub struct Instruction {
 #[derive(Debug, Clone)]
 pub struct Register {
     pub data_input: Signal,
-    pub output: Signal,
-    pub clock: Option<Signal>,
-    pub reset: Option<Signal>,
     pub initial: bool,
     pub name_index: Option<u32>,
 }
@@ -86,8 +83,8 @@ impl fmt::Display for Error {
 }
 
 pub struct CircuitBuilder {
-    instructions: PrimaryMap<Signal, Instruction>,
-    registers: PrimaryMap<Reg, Register>,
+    insts: PrimaryMap<Signal, Instruction>,
+    regs: PrimaryMap<Reg, Register>,
 
     input_names: Vec<String>,
     output_names: Vec<String>,
@@ -109,8 +106,8 @@ impl Default for CircuitBuilder {
 impl CircuitBuilder {
     pub fn new() -> Self {
         Self {
-            instructions: PrimaryMap::new(),
-            registers: PrimaryMap::new(),
+            insts: PrimaryMap::new(),
+            regs: PrimaryMap::new(),
             input_names: Vec::new(),
             output_names: Vec::new(),
             output_signals: Vec::new(),
@@ -127,19 +124,59 @@ impl CircuitBuilder {
         self.next_input_index += 1;
 
         self.input_names.push(name);
-        self.instructions
-            .push(Instruction { data: InstData::Input { index }, debug_name_index: None })
+        self.insts.push(Instruction { data: InstData::Input { index }, debug_name_index: None })
     }
 
-    pub fn and(&mut self, a: Signal, b: Signal) -> Signal {
+    pub fn const_val(&mut self, value: bool) -> Signal {
+        self.insts.push(Instruction { data: InstData::Const { value }, debug_name_index: None })
+    }
+
+    pub fn unary(&mut self, op: GateOp, input: Signal) -> Signal {
+        assert!(matches!(op, GateOp::Not | GateOp::Buf));
+        let mut inputs = EntityList::new();
+        inputs.push(input, &mut self.list_pool);
+
+        self.insts.push(Instruction { data: InstData::Gate { op, inputs }, debug_name_index: None })
+    }
+
+    pub fn binary(&mut self, op: GateOp, a: Signal, b: Signal) -> Signal {
+        assert!(matches!(
+            op,
+            GateOp::And | GateOp::Or | GateOp::Xor | GateOp::Nand | GateOp::Nor | GateOp::Xnor
+        ));
         let mut inputs = EntityList::new();
         inputs.push(a, &mut self.list_pool);
         inputs.push(b, &mut self.list_pool);
 
-        self.instructions.push(Instruction {
-            data: InstData::Gate { op: GateOp::And, inputs },
+        self.insts.push(Instruction { data: InstData::Gate { op, inputs }, debug_name_index: None })
+    }
+
+    pub fn mux(&mut self, sel: Signal, then_val: Signal, else_val: Signal) -> Signal {
+        let mut inputs = EntityList::new();
+        inputs.push(sel, &mut self.list_pool);
+        inputs.push(then_val, &mut self.list_pool);
+        inputs.push(else_val, &mut self.list_pool);
+
+        self.insts.push(Instruction {
+            data: InstData::Gate { op: GateOp::Mux, inputs },
             debug_name_index: None,
         })
+    }
+
+    pub fn and(&mut self, a: Signal, b: Signal) -> Signal {
+        self.binary(GateOp::And, a, b)
+    }
+    pub fn or(&mut self, a: Signal, b: Signal) -> Signal {
+        self.binary(GateOp::Or, a, b)
+    }
+    pub fn xor(&mut self, a: Signal, b: Signal) -> Signal {
+        self.binary(GateOp::Xor, a, b)
+    }
+    pub fn not(&mut self, a: Signal) -> Signal {
+        self.unary(GateOp::Not, a)
+    }
+    pub fn nand(&mut self, a: Signal, b: Signal) -> Signal {
+        self.binary(GateOp::Nand, a, b)
     }
 
     pub fn register(&mut self, name: impl Into<String>, data: Signal, initial: bool) -> Signal {
@@ -147,21 +184,11 @@ impl CircuitBuilder {
         let name_index = self.debug_names.len() as u32;
         self.debug_names.push(name);
 
-        let output_sig = self.instructions.push(Instruction {
+        self.regs.push(Register { data_input: data, initial, name_index: Some(name_index) });
+        self.insts.push(Instruction {
             data: InstData::Const { value: initial },
             debug_name_index: Some(name_index),
-        });
-
-        self.registers.push(Register {
-            data_input: data,
-            output: output_sig,
-            clock: None,
-            reset: None,
-            initial,
-            name_index: Some(name_index),
-        });
-
-        output_sig
+        })
     }
 
     pub fn output(&mut self, name: impl Into<String>, signal: Signal) {
@@ -175,7 +202,7 @@ impl CircuitBuilder {
 
         Ok(Circuit {
             insts: sorted,
-            regs: self.registers,
+            regs: self.regs,
             input_names: self.input_names,
             output_names: self.output_names,
             output_signals: self.output_signals,
@@ -188,10 +215,10 @@ impl CircuitBuilder {
     }
 
     fn topo_sort(&self) -> Result<PrimaryMap<Signal, Instruction>, Error> {
-        let mut in_degree: HashMap<Signal, u32> = HashMap::new();
-        let mut dependents: HashMap<Signal, Vec<Signal>> = HashMap::new();
+        let mut in_degree: HashMap<_, _> = HashMap::with_capacity(self.insts.len());
+        let mut dependents: HashMap<_, Vec<_>> = HashMap::with_capacity(self.insts.len());
 
-        for (sig, inst) in self.instructions.iter() {
+        for (sig, inst) in self.insts.iter() {
             in_degree.entry(sig).or_insert(0);
             if let InstData::Gate { inputs, .. } = &inst.data {
                 for &input in inputs.as_slice(&self.list_pool) {
@@ -204,10 +231,10 @@ impl CircuitBuilder {
         let mut queue: VecDeque<_> =
             in_degree.iter().filter(|(_, deg)| **deg == 0).map(|(sig, _)| *sig).collect();
 
-        let mut sorted = PrimaryMap::with_capacity(self.instructions.len());
+        let mut sorted = PrimaryMap::with_capacity(self.insts.len());
 
         while let Some(sig) = queue.pop_front() {
-            if let Some(inst) = self.instructions.get(sig) {
+            if let Some(inst) = self.insts.get(sig) {
                 sorted.push(inst.clone());
             }
             if let Some(deps) = dependents.get(&sig) {
@@ -221,7 +248,7 @@ impl CircuitBuilder {
             }
         }
 
-        if sorted.len() != self.instructions.len() {
+        if sorted.len() != self.insts.len() {
             return Err(Error::CycleDetected);
         }
 

@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet, hash_map};
 #[cfg(not(feature = "std"))]
 use hashbrown::{HashMap, HashSet, hash_map};
 
+mod backend;
 mod circuit;
 
-pub use circuit::{Circuit, CircuitBuilder, Reg, Register, Signal};
+pub use backend::{Backend, Interpreter};
+pub use circuit::{Circuit, CircuitBuilder, GateOp, InstData, Instruction, Reg, Register, Signal};
