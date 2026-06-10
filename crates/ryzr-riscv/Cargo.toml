@@ -1,0 +1,21 @@
+[package]
+name = "ryzr-riscv"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+ryzr-core = { path = "../ryzr-core" }
+
+[dev-dependencies]
+ryzr-backend = { path = "../ryzr-backend" }
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "riscv"
+harness = false
