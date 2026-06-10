@@ -1,0 +1,107 @@
+     class   op  windows   gates  funnels   splats     selU
+     a:1-8    0       54     122       17      175        0
+     a:1-8    1       71     150       25      223        0
+     a:1-8    2       69     126       22      183        0
+     a:1-8    6       12      13        0       12        0
+     a:1-8    8       30     127       26      294        1
+    b:9-63    0       17     397       29      158        0
+    b:9-63    1        3      59        2       54        0
+    b:9-63    2        2      65        3        2        0
+    b:9-63    6        2      67        2        5        0
+    b:9-63    8       29     958       53      957        4
+  c:64-255    0       12     455        9      121        0
+  c:64-255    2        4     163        0      199        0
+  c:64-255    8       27    1299       70      497       13
+    d:256+    0        5     259        5        7        0
+    d:256+    8      294   18419     1092     4396      146
+     TOTAL           631   22679     1355     7283      164
+
+gates per level (first 100):
+  level   1: 192
+  level   2: 66
+  level   3: 33
+  level   4: 1119
+  level   5: 528
+  level   6: 279
+  level   7: 154
+  level   8: 99
+  level   9: 27
+  level  10: 71
+  level  11: 37
+  level  12: 68
+  level  13: 66
+  level  14: 261
+  level  15: 243
+  level  16: 79
+  level  17: 107
+  level  18: 74
+  level  19: 79
+  level  20: 49
+  level  21: 4112
+  level  22: 12
+  level  23: 2060
+  level  24: 12
+  level  25: 1038
+  level  26: 14
+  level  27: 530
+  level  28: 18
+  level  29: 282
+  level  30: 26
+  level  31: 170
+  level  32: 42
+  level  33: 138
+  level  34: 74
+  level  35: 170
+  level  36: 330
+  level  37: 4265
+  level  38: 4218
+  level  39: 73
+  level  40: 42
+  level  41: 18
+  level  42: 289
+  level  43: 10
+  level  44: 41
+  level  45: 10
+  level  46: 41
+  level  47: 10
+  level  48: 41
+  level  49: 10
+  level  50: 41
+  level  51: 10
+  level  52: 41
+  level  53: 10
+  level  54: 41
+  level  55: 10
+  level  56: 41
+  level  57: 10
+  level  58: 41
+  level  59: 10
+  level  60: 41
+  level  61: 10
+  level  62: 41
+  level  63: 10
+  level  64: 41
+  level  65: 10
+  level  66: 39
+  level  67: 9
+  level  68: 39
+  level  69: 9
+  level  70: 39
+  level  71: 9
+  level  72: 39
+  level  73: 9
+  level  74: 39
+  level  75: 9
+  level  76: 39
+  level  77: 7
+  level  78: 38
+  level  79: 8
+  level  80: 35
+  level  81: 5
+  level  82: 35
+  level  83: 4
+  level  84: 34
+  level  85: 3
+  level  86: 64
+  level  87: 1
+  level  88: 31

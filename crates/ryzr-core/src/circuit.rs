@@ -1,4 +1,3 @@
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -302,43 +301,24 @@ impl CircuitBuilder {
         })
     }
 
-    /// Kahn's algorithm over the combinational graph, deterministic by
-    /// processing signals in creation order. Register outputs are sources
-    /// (they read the previous tick's state), so cycles through registers
-    /// are fine; only purely combinational cycles are rejected.
+    /// Creation order *is* a topological order: every builder method only
+    /// accepts already-created signals, and register outputs are sources
+    /// (they read the previous tick's state), so combinational cycles are
+    /// unconstructible. Preserving creation order keeps word-shaped
+    /// structures (adders, mux trees, shifter stages) contiguous in the
+    /// schedule, which backends rely on for dense, funnel-shift friendly
+    /// memory layouts; a Kahn/BFS order would interleave unrelated
+    /// structures and scatter those words.
     fn topo_order(&self) -> Result<Vec<Signal>, Error> {
-        let n = self.insts.len();
-        let mut in_degree = vec![0u32; n];
-        let mut dependents = vec![Vec::new(); n];
-
         for (sig, inst) in self.insts.iter() {
             if let InstData::Gate { inputs, .. } = &inst.data {
-                let inputs = inputs.as_slice(&self.list_pool);
-                in_degree[sig.index()] = inputs.len() as u32;
-                for &input in inputs {
-                    dependents[input.index()].push(sig);
+                for &input in inputs.as_slice(&self.list_pool) {
+                    if input.index() >= sig.index() {
+                        return Err(Error::CycleDetected);
+                    }
                 }
             }
         }
-
-        let mut queue: VecDeque<Signal> =
-            (0..n).map(Signal::new).filter(|s| in_degree[s.index()] == 0).collect();
-        let mut order = Vec::with_capacity(n);
-
-        while let Some(sig) = queue.pop_front() {
-            order.push(sig);
-            for &dep in &dependents[sig.index()] {
-                in_degree[dep.index()] -= 1;
-                if in_degree[dep.index()] == 0 {
-                    queue.push_back(dep);
-                }
-            }
-        }
-
-        if order.len() != n {
-            return Err(Error::CycleDetected);
-        }
-
-        Ok(order)
+        Ok(self.insts.keys().collect())
     }
 }

@@ -130,4 +130,52 @@ fn main() {
             println!("  level {lvl:>3}: {g}");
         }
     }
+
+    // Attribute mux splats per level for the big runs: which structure
+    // (RAM read tree / write muxes / regfile) is splat-heavy?
+    println!("\nmux splats by level (runs >= 256 gates):");
+    for run in &tape.runs {
+        let size = (run.end - run.start) as usize;
+        if size < 256 || arity(run.op) != 3 {
+            continue;
+        }
+        let lvl = tape.slot_level[run.start as usize];
+        let (mut fa, mut sa, mut fb, mut sb, mut fc, mut sc) = (0, 0, 0, 0, 0, 0);
+        let mut s = run.start as usize;
+        while s < run.end as usize {
+            let e = usize::min(s + 64, run.end as usize);
+            let (f, sp) = scan(&tape.a[s..e], &is_const);
+            fa += f;
+            sa += sp;
+            let (f, sp) = scan(&tape.b[s..e], &is_const);
+            fb += f;
+            sb += sp;
+            let (f, sp) = scan(&tape.c[s..e], &is_const);
+            fc += f;
+            sc += sp;
+            s = e;
+        }
+        println!(
+            "  level {lvl:>3} size {size:>5}: sel {fa}f/{sa}s  then {fb}f/{sb}s  else {fc}f/{sc}s"
+        );
+    }
+
+    dump_window(&tape);
+}
+
+#[allow(dead_code)]
+fn dump_window(tape: &Compiled) {
+    for run in &tape.runs {
+        let size = (run.end - run.start) as usize;
+        let lvl = tape.slot_level[run.start as usize];
+        if size < 4000 || arity(run.op) != 3 || lvl < 30 {
+            continue;
+        }
+        let s = run.start as usize + 2048;
+        println!("\nrun level {lvl} size {size}: mid-run window b-stream (then):");
+        for &src in &tape.b[s..s + 36] {
+            println!("  src {:>6} level {}", src, tape.slot_level[src as usize]);
+        }
+        break;
+    }
 }
