@@ -38,16 +38,16 @@ fn build_counter(n: u32) -> Circuit {
     let mut bits = Vec::new();
     for i in 0..n {
         let bit = b.const_val(false);
-        bits.push(b.register(format!("BIT{}", i), bit, false));
+        bits.push(b.register(format!("BIT{i}"), bit, false));
     }
 
     let mut carry = b.const_val(true);
     let mut next_bits = Vec::new();
 
-    for i in 0..n as usize {
-        let next = b.xor(bits[i], carry);
+    for &bit in bits.iter().take(n as usize) {
+        let next = b.xor(bit, carry);
         next_bits.push(next);
-        carry = b.and(carry, bits[i]);
+        carry = b.and(carry, bit);
     }
 
     for (i, &next) in next_bits.iter().enumerate() {

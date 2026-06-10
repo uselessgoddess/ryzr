@@ -1,5 +1,4 @@
 use alloc::vec;
-use alloc::vec::Vec;
 
 use cranelift_entity::EntityRef;
 
@@ -30,28 +29,23 @@ impl Backend for Interpreter {
                 InstData::Input { index } => inputs[*index as usize],
                 InstData::RegisterOutput { reg } => state[reg.index()],
                 InstData::Gate { op, inputs } => {
-                    let input_vals: [bool; 3] = inputs
-                        .as_slice(&circuit.list_pool)
-                        .iter()
-                        .map(|&s| values[s.index()])
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .unwrap_or([false; 3]);
+                    let inputs = inputs.as_slice(&circuit.list_pool);
+                    let v = |i: usize| values[inputs[i].index()];
 
                     match op {
-                        GateOp::And => input_vals[0] && input_vals[1],
-                        GateOp::Or => input_vals[0] || input_vals[1],
-                        GateOp::Xor => input_vals[0] ^ input_vals[1],
-                        GateOp::Not => !input_vals[0],
-                        GateOp::Nand => !(input_vals[0] && input_vals[1]),
-                        GateOp::Nor => !(input_vals[0] || input_vals[1]),
-                        GateOp::Xnor => !(input_vals[0] ^ input_vals[1]),
-                        GateOp::Buf => input_vals[0],
+                        GateOp::And => v(0) && v(1),
+                        GateOp::Or => v(0) || v(1),
+                        GateOp::Xor => v(0) ^ v(1),
+                        GateOp::Not => !v(0),
+                        GateOp::Nand => !(v(0) && v(1)),
+                        GateOp::Nor => !(v(0) || v(1)),
+                        GateOp::Xnor => !(v(0) ^ v(1)),
+                        GateOp::Buf => v(0),
                         GateOp::Mux => {
-                            if input_vals[0] {
-                                input_vals[1]
+                            if v(0) {
+                                v(1)
                             } else {
-                                input_vals[2]
+                                v(2)
                             }
                         }
                     }

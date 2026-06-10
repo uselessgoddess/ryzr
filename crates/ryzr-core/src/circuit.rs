@@ -3,9 +3,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use cranelift_entity::{EntityList, ListPool, PrimaryMap, entity_impl};
-
-use crate::HashMap;
+use cranelift_entity::{EntityList, EntityRef, ListPool, PrimaryMap, entity_impl};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Signal(u32);
@@ -202,71 +200,91 @@ impl CircuitBuilder {
     }
 
     pub fn finish(self) -> Result<Circuit, Error> {
-        let sorted = self.topo_sort()?;
+        let order = self.topo_order()?;
         let register_count = self.regs.len() as u32;
         let output_count = self.output_names.len() as u32;
 
+        // old signal id -> position in the topo schedule (= new signal id)
+        let mut remap = vec![Signal::new(0); order.len()];
+        for (new_index, &old) in order.iter().enumerate() {
+            remap[old.index()] = Signal::new(new_index);
+        }
+
+        let mut list_pool = ListPool::new();
+        let mut insts = PrimaryMap::with_capacity(order.len());
+        for &old in &order {
+            let inst = &self.insts[old];
+            let data = match &inst.data {
+                InstData::Gate { op, inputs } => {
+                    let mut remapped = EntityList::new();
+                    for &input in inputs.as_slice(&self.list_pool) {
+                        remapped.push(remap[input.index()], &mut list_pool);
+                    }
+                    InstData::Gate { op: *op, inputs: remapped }
+                }
+                other => other.clone(),
+            };
+            insts.push(Instruction { data, debug_name_index: inst.debug_name_index });
+        }
+
+        let mut regs = PrimaryMap::with_capacity(self.regs.len());
+        for (_, reg) in self.regs.iter() {
+            regs.push(Register { data_input: remap[reg.data_input.index()], ..reg.clone() });
+        }
+
+        let output_signals = self.output_signals.iter().map(|s| remap[s.index()]).collect();
+
         Ok(Circuit {
-            insts: sorted,
-            regs: self.regs,
+            insts,
+            regs,
             input_names: self.input_names,
             output_names: self.output_names,
-            output_signals: self.output_signals,
+            output_signals,
             debug_names: self.debug_names,
-            list_pool: self.list_pool,
+            list_pool,
             input_count: self.next_input_index,
             register_count,
             output_count,
         })
     }
 
-    fn topo_sort(&self) -> Result<PrimaryMap<Signal, Instruction>, Error> {
-        let mut in_degree = HashMap::with_capacity(self.insts.len());
-        let mut dependents: HashMap<_, Vec<_>> = HashMap::with_capacity(self.insts.len());
+    /// Kahn's algorithm over the combinational graph, deterministic by
+    /// processing signals in creation order. Register outputs are sources
+    /// (they read the previous tick's state), so cycles through registers
+    /// are fine; only purely combinational cycles are rejected.
+    fn topo_order(&self) -> Result<Vec<Signal>, Error> {
+        let n = self.insts.len();
+        let mut in_degree = vec![0u32; n];
+        let mut dependents = vec![Vec::new(); n];
 
         for (sig, inst) in self.insts.iter() {
-            match &inst.data {
-                InstData::Const { .. }
-                | InstData::Input { .. }
-                | InstData::RegisterOutput { .. } => {
-                    in_degree.insert(sig, 0);
-                }
-                InstData::Gate { inputs, .. } => {
-                    let input_count = inputs.as_slice(&self.list_pool).len() as u32;
-                    in_degree.insert(sig, input_count);
-
-                    for &input in inputs.as_slice(&self.list_pool) {
-                        dependents.entry(input).or_default().push(sig);
-                    }
+            if let InstData::Gate { inputs, .. } = &inst.data {
+                let inputs = inputs.as_slice(&self.list_pool);
+                in_degree[sig.index()] = inputs.len() as u32;
+                for &input in inputs {
+                    dependents[input.index()].push(sig);
                 }
             }
         }
 
-        let mut queue: VecDeque<_> =
-            in_degree.iter().filter(|(_, deg)| **deg == 0).map(|(sig, _)| *sig).collect();
-
-        let mut sorted = PrimaryMap::with_capacity(self.insts.len());
+        let mut queue: VecDeque<Signal> =
+            (0..n).map(Signal::new).filter(|s| in_degree[s.index()] == 0).collect();
+        let mut order = Vec::with_capacity(n);
 
         while let Some(sig) = queue.pop_front() {
-            if let Some(inst) = self.insts.get(sig) {
-                sorted.push(inst.clone());
-            }
-
-            if let Some(deps) = dependents.get(&sig) {
-                for &dep in deps {
-                    let deg = in_degree.get_mut(&dep).unwrap();
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(dep);
-                    }
+            order.push(sig);
+            for &dep in &dependents[sig.index()] {
+                in_degree[dep.index()] -= 1;
+                if in_degree[dep.index()] == 0 {
+                    queue.push_back(dep);
                 }
             }
         }
 
-        if sorted.len() != self.insts.len() {
+        if order.len() != n {
             return Err(Error::CycleDetected);
         }
 
-        Ok(sorted)
+        Ok(order)
     }
 }
