@@ -30,6 +30,8 @@ mod hybrid;
 #[cfg(feature = "jit")]
 mod jit;
 mod pack;
+#[cfg(feature = "jit")]
+mod pack_jit;
 mod scalar;
 #[cfg(feature = "rayon")]
 mod threaded;
@@ -42,6 +44,8 @@ pub use hybrid::{HybridEngine, Strategy};
 #[cfg(feature = "jit")]
 pub use jit::JitEngine;
 pub use pack::PackedEngine;
+#[cfg(feature = "jit")]
+pub use pack_jit::PackedJitEngine;
 pub use scalar::ScalarEngine;
 #[cfg(feature = "rayon")]
 pub use threaded::ThreadedEngine;

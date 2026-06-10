@@ -46,38 +46,58 @@ const FUNNEL_MIN: usize = 3;
 /// One gather step. `kind` is implicit in the pool layout: each stream
 /// stores its funnel segments first, then its splat segments.
 #[derive(Clone, Copy)]
-struct Seg {
+pub(crate) struct Seg {
     /// Source bit position in the arena.
-    src: u32,
+    pub(crate) src: u32,
     /// Destination shift (funnel only; splat destinations live in `mask`).
-    shift: u8,
+    pub(crate) shift: u8,
     /// Destination bits this segment is allowed to write.
-    mask: u64,
+    pub(crate) mask: u64,
 }
 
 /// Per-stream slice of the segment pool.
 #[derive(Clone, Copy, Default)]
-struct StreamRef {
-    funnels: u8,
-    splats: u8,
+pub(crate) struct StreamRef {
+    pub(crate) funnels: u8,
+    pub(crate) splats: u8,
 }
 
 /// One output word: up to 64 same-op gates of one run.
 #[derive(Clone, Copy)]
-struct Task {
-    op: Op,
+pub(crate) struct Task {
+    pub(crate) op: Op,
     /// Destination word index in the arena.
-    dst: u32,
-    streams: [StreamRef; 3],
+    pub(crate) dst: u32,
+    pub(crate) streams: [StreamRef; 3],
     /// Constant-folded bits per operand stream.
-    imm: [u64; 3],
+    pub(crate) imm: [u64; 3],
 }
 
 /// Where an output reads from.
 #[derive(Clone, Copy)]
-enum OutSrc {
+pub(crate) enum OutSrc {
     Bit(u32),
     Const(bool),
+}
+
+/// The complete word-level execution plan: arena layout, gather programs
+/// and register capture. [`PackedEngine`] interprets it; the packed JIT
+/// engine compiles it to native code. Both execute the exact same plan.
+pub(crate) struct Plan {
+    /// Arena size in words (including the trailing pad word).
+    pub(crate) words: usize,
+    pub(crate) tasks: Vec<Task>,
+    /// Shared segment pool, consumed in task/stream order.
+    pub(crate) segs: Vec<Seg>,
+    /// Gather program for the register capture: one entry per staging word.
+    pub(crate) capture: Vec<(u64, StreamRef)>,
+    pub(crate) cap_segs: Vec<Seg>,
+    /// Word range of the register-output region (edge = word copy).
+    pub(crate) reg_word: usize,
+    /// Initial staging content, kept for reset.
+    pub(crate) reg_init: Vec<u64>,
+    pub(crate) outputs: Vec<OutSrc>,
+    pub(crate) input_count: usize,
 }
 
 pub struct PackedEngine {
@@ -85,18 +105,7 @@ pub struct PackedEngine {
     bits: Vec<u64>,
     /// Register next-state captured at tick end, applied at next tick start.
     staging: Vec<u64>,
-    tasks: Vec<Task>,
-    /// Shared segment pool, consumed in task/stream order.
-    segs: Vec<Seg>,
-    /// Gather program for the register capture: one entry per staging word.
-    capture: Vec<(u64, StreamRef)>,
-    cap_segs: Vec<Seg>,
-    /// Word range of the register-output region (edge = word copy).
-    reg_word: usize,
-    /// Initial staging content, kept for reset.
-    reg_init: Vec<u64>,
-    outputs: Vec<OutSrc>,
-    input_count: usize,
+    plan: Plan,
 }
 
 fn ones(len: usize) -> u64 {
@@ -192,12 +201,8 @@ fn gather(bits: &[u64], segs: &[Seg], funnels: usize, imm: u64) -> u64 {
     acc
 }
 
-impl PackedEngine {
-    pub fn new(circuit: &ryzr_core::Circuit) -> Self {
-        Self::with_tape(&Compiled::new(circuit))
-    }
-
-    pub fn with_tape(tape: &Compiled) -> Self {
+impl Plan {
+    pub(crate) fn new(tape: &Compiled) -> Self {
         let n = tape.slot_count();
 
         // Constant values per slot; u8::MAX = not a constant.
@@ -285,9 +290,8 @@ impl PackedEngine {
             })
             .collect();
 
-        let mut engine = Self {
-            bits: vec![0; words],
-            staging: vec![0; reg_init.len()],
+        Self {
+            words,
             tasks,
             segs,
             capture,
@@ -296,7 +300,19 @@ impl PackedEngine {
             reg_init,
             outputs,
             input_count: tape.input_slots.len(),
-        };
+        }
+    }
+}
+
+impl PackedEngine {
+    pub fn new(circuit: &ryzr_core::Circuit) -> Self {
+        Self::with_tape(&Compiled::new(circuit))
+    }
+
+    pub fn with_tape(tape: &Compiled) -> Self {
+        let plan = Plan::new(tape);
+        let mut engine =
+            Self { bits: vec![0; plan.words], staging: vec![0; plan.reg_init.len()], plan };
         engine.reset();
         engine
     }
@@ -304,8 +320,9 @@ impl PackedEngine {
     /// Restore power-on state: register initials latched, inputs low.
     pub(crate) fn reset(&mut self) {
         self.bits.fill(0);
-        self.staging.copy_from_slice(&self.reg_init);
-        self.bits[self.reg_word..self.reg_word + self.staging.len()].copy_from_slice(&self.staging);
+        self.staging.copy_from_slice(&self.plan.reg_init);
+        self.bits[self.plan.reg_word..self.plan.reg_word + self.staging.len()]
+            .copy_from_slice(&self.staging);
     }
 }
 
@@ -315,15 +332,15 @@ impl Engine for PackedEngine {
     }
 
     fn input_count(&self) -> usize {
-        self.input_count
+        self.plan.input_count
     }
 
     fn output_count(&self) -> usize {
-        self.outputs.len()
+        self.plan.outputs.len()
     }
 
     fn set_input(&mut self, index: usize, value: bool) {
-        debug_assert!(index < self.input_count);
+        debug_assert!(index < self.plan.input_count);
         let mask = 1u64 << (index % 64);
         if value {
             self.bits[index / 64] |= mask;
@@ -333,7 +350,7 @@ impl Engine for PackedEngine {
     }
 
     fn output(&self, index: usize) -> bool {
-        match self.outputs[index] {
+        match self.plan.outputs[index] {
             OutSrc::Bit(p) => self.bits[(p >> 6) as usize] >> (p & 63) & 1 != 0,
             OutSrc::Const(v) => v,
         }
@@ -342,12 +359,13 @@ impl Engine for PackedEngine {
     fn tick(&mut self) {
         // Clock edge: the register region is contiguous and word-aligned,
         // so applying the captured next-state is a straight word copy.
-        self.bits[self.reg_word..self.reg_word + self.staging.len()].copy_from_slice(&self.staging);
+        self.bits[self.plan.reg_word..self.plan.reg_word + self.staging.len()]
+            .copy_from_slice(&self.staging);
 
         // Combinational settle: tasks are in (level, op) tape order, so
         // every gather reads only already-settled words.
-        let mut cursor = self.segs.as_slice();
-        for task in &self.tasks {
+        let mut cursor = self.plan.segs.as_slice();
+        for task in &self.plan.tasks {
             let mut take = |sr: StreamRef| {
                 let n = sr.funnels as usize + sr.splats as usize;
                 let (head, rest) = cursor.split_at(n);
@@ -380,8 +398,8 @@ impl Engine for PackedEngine {
         // Capture every live register's next state into staging; the edge
         // at the start of the next tick applies it, so output() observes
         // settled pre-edge values.
-        let mut cursor = self.cap_segs.as_slice();
-        for (k, &(imm, sr)) in self.capture.iter().enumerate() {
+        let mut cursor = self.plan.cap_segs.as_slice();
+        for (k, &(imm, sr)) in self.plan.capture.iter().enumerate() {
             let n = sr.funnels as usize + sr.splats as usize;
             let (head, rest) = cursor.split_at(n);
             cursor = rest;

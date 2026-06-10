@@ -5,7 +5,9 @@
 
 use std::time::Instant;
 
-use ryzr_backend::{Engine, EventEngine, HybridEngine, JitEngine, PackedEngine, ScalarEngine};
+use ryzr_backend::{
+    Engine, EventEngine, HybridEngine, JitEngine, PackedEngine, PackedJitEngine, ScalarEngine,
+};
 use ryzr_riscv::{build_cpu, programs};
 
 fn main() {
@@ -14,6 +16,7 @@ fn main() {
         Box::new(ScalarEngine::new(&circuit)),
         Box::new(EventEngine::new(&circuit)),
         Box::new(PackedEngine::new(&circuit)),
+        Box::new(PackedJitEngine::new(&circuit)),
         Box::new(JitEngine::new(&circuit)),
         Box::new(HybridEngine::new(&circuit)),
         // The wide mode ticks 64 CPUs at once; shown here as its

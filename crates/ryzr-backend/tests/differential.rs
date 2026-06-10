@@ -2,13 +2,13 @@
 //! outputs to the `ryzr-core` reference interpreter, on every tick, for
 //! randomly generated sequential circuits and random input sequences.
 
-#[cfg(feature = "jit")]
-use ryzr_backend::JitEngine;
 #[cfg(feature = "rayon")]
 use ryzr_backend::ThreadedEngine;
 use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
 #[cfg(all(feature = "jit", feature = "rayon"))]
 use ryzr_backend::{Compiled, HybridEngine, Strategy};
+#[cfg(feature = "jit")]
+use ryzr_backend::{JitEngine, PackedJitEngine};
 use ryzr_core::{Backend, Circuit, CircuitBuilder, Interpreter, Signal};
 
 /// Deterministic xorshift64* PRNG — no rand dependency, reproducible cases.
@@ -126,6 +126,8 @@ fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
         Box::new(ThreadedEngine::new(circuit).with_threshold(4)),
         #[cfg(feature = "jit")]
         Box::new(JitEngine::new(circuit)),
+        #[cfg(feature = "jit")]
+        Box::new(PackedJitEngine::new(circuit)),
         // The single-instance racer: whichever candidate wins must match.
         #[cfg(all(feature = "jit", feature = "rayon"))]
         Box::new(HybridEngine::new(circuit)),
