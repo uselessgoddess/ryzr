@@ -97,7 +97,7 @@ enum Single {
     Packed(PackedEngine),
     Event(EventEngine),
     Threaded(ThreadedEngine),
-    Jit(JitEngine),
+    Jit(Box<JitEngine>),
 }
 
 impl Single {
@@ -106,7 +106,7 @@ impl Single {
             Self::Packed(e) => e,
             Self::Event(e) => e,
             Self::Threaded(e) => e,
-            Self::Jit(e) => e,
+            Self::Jit(e) => e.as_ref(),
         }
     }
 
@@ -115,7 +115,7 @@ impl Single {
             Self::Packed(e) => e,
             Self::Event(e) => e,
             Self::Threaded(e) => e,
-            Self::Jit(e) => e,
+            Self::Jit(e) => e.as_mut(),
         }
     }
 
@@ -132,15 +132,15 @@ impl Single {
 /// Race every single-instance candidate on the live circuit and return the
 /// winner, restored to power-on state (racing advances the simulation, so
 /// the winner is reset before use).
-fn race_single(tape: &Arc<Compiled>, threshold: usize) -> Single {
+fn race_single(tape: Arc<Compiled>, threshold: usize) -> Single {
     let mut candidates = vec![
-        Single::Packed(PackedEngine::with_tape(tape)),
+        Single::Packed(PackedEngine::with_tape(&tape)),
         Single::Event(EventEngine::with_tape(tape.clone())),
         Single::Threaded(ThreadedEngine::with_tape(tape.clone()).with_threshold(threshold)),
     ];
     // Oversized circuits can't be jitted (slot offsets exceed i32).
     if i32::try_from(tape.slot_count()).is_ok() {
-        candidates.push(Single::Jit(JitEngine::with_tape(tape.clone())));
+        candidates.push(Single::Jit(Box::new(JitEngine::with_tape(tape))));
     }
 
     let mut best: Option<(Duration, Single)> = None;
@@ -420,7 +420,7 @@ fn build_jit_plan(tape: &Compiled, threshold: usize) -> JitPlan {
 }
 
 enum Mode {
-    Single(Single),
+    Single(Box<Single>),
     Wide(Box<Wide>),
 }
 
@@ -437,7 +437,7 @@ impl HybridEngine {
 
     /// Single-instance mode from an already-compiled tape.
     pub fn with_tape(tape: Arc<Compiled>) -> Self {
-        Self { mode: Mode::Single(race_single(&tape, PARALLEL_THRESHOLD)) }
+        Self { mode: Mode::Single(Box::new(race_single(tape, PARALLEL_THRESHOLD))) }
     }
 
     /// Like [`new`](Self::new), but with a custom width at which the
@@ -445,7 +445,7 @@ impl HybridEngine {
     /// useful for exercising the parallel path on small circuits.
     pub fn with_parallel_threshold(circuit: &ryzr_core::Circuit, threshold: usize) -> Self {
         let tape = Arc::new(Compiled::new(circuit));
-        Self { mode: Mode::Single(race_single(&tape, threshold.max(1))) }
+        Self { mode: Mode::Single(Box::new(race_single(tape, threshold.max(1)))) }
     }
 
     /// The wide mode: 64 independent instances bit-packed per value slot,
