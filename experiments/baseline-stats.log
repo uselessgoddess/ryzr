@@ -1,0 +1,6 @@
+slots:      32192
+gates:      22679
+registers:  9216
+levels:     88
+runs:       324
+widest level: 4265 gates

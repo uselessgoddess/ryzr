@@ -1,0 +1,42 @@
+== creation order, FUNNEL_MIN=2 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  53.2%   splat:  45.9%
+  funnel segments: 1998 (1.23/stream)   splat values: 6709 (4.12/stream)
+  op budget: packed ~51944, scalar ~136074 (2.62x)
+
+== creation order, FUNNEL_MIN=3 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  51.3%   splat:  47.8%
+  funnel segments: 1355 (0.83/stream)   splat values: 7283 (4.47/stream)
+  op budget: packed ~50956, scalar ~136074 (2.67x)
+
+== creation order, FUNNEL_MIN=4 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  50.5%   splat:  48.6%
+  funnel segments: 1176 (0.72/stream)   splat values: 7819 (4.80/stream)
+  op budget: packed ~52562, scalar ~136074 (2.59x)
+
+== creation order, FUNNEL_MIN=6 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  50.4%   splat:  48.7%
+  funnel segments: 1166 (0.72/stream)   splat values: 7862 (4.83/stream)
+  op budget: packed ~52717, scalar ~136074 (2.58x)
+
+== creation order, FUNNEL_MIN=8 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  50.3%   splat:  48.7%
+  funnel segments: 1161 (0.71/stream)   splat values: 7893 (4.85/stream)
+  op budget: packed ~52842, scalar ~136074 (2.58x)
+
+== creation order, FUNNEL_MIN=16 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  46.3%   splat:  52.8%
+  funnel segments: 855 (0.53/stream)   splat values: 9549 (5.87/stream)
+  op budget: packed ~59286, scalar ~136074 (2.30x)
+
+== operand-sorted within runs, FUNNEL_MIN=8 ==
+gates: 22679, output words: 631, operand bits: 66081
+  const-folded:   0.9%   funnel:  49.8%   splat:  49.3%
+  funnel segments: 1192 (0.73/stream)   splat values: 8258 (5.07/stream)
+  op budget: packed ~54853, scalar ~136074 (2.48x)
+
