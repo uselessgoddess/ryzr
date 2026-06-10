@@ -45,8 +45,9 @@ jobs:
           {
             echo "## RISC-V: gate-level RV32I, fib(n) loop"
             echo
-            echo "Throughput is retired instructions per second; SWAR engines"
-            echo "(batch64, hybrid) run 64 independent processors at once."
+            echo "Throughput is retired instructions per second; wide SWAR"
+            echo "engines (batch64, hybrid64) run 64 independent processors"
+            echo "at once, every other engine accelerates a single processor."
             echo
             echo '```'
             grep -E '^riscv/|time:|thrpt:' riscv-bench.log

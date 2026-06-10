@@ -35,20 +35,29 @@ impl EventEngine {
     }
 
     pub fn with_tape(tape: Arc<Compiled>) -> Self {
-        let values = tape.initial_values();
-        let reg_scratch = tape.reg_initial.clone();
+        let reg_scratch = vec![0; tape.register_count()];
         let max_level = tape.slot_level.iter().copied().max().unwrap_or(0) as usize;
         let buckets = vec![Vec::new(); max_level + 1];
         let queued = vec![0u64; tape.slot_count().div_ceil(64)];
-        let mut engine = Self { tape, values, reg_scratch, buckets, queued };
-
-        // The initial value buffer is all-zero apart from sources; gate
-        // slots have never been evaluated. Seed every gate once so the
-        // first tick settles the whole circuit.
-        for slot in engine.tape.gate_start..engine.tape.slot_count() as u32 {
-            engine.enqueue(slot);
-        }
+        let mut engine = Self { tape, values: Vec::new(), reg_scratch, buckets, queued };
+        engine.reset();
         engine
+    }
+
+    /// Restore power-on state: constants, register initials, inputs low.
+    pub(crate) fn reset(&mut self) {
+        self.values = self.tape.initial_values();
+        self.reg_scratch.copy_from_slice(&self.tape.reg_initial);
+        self.queued.fill(0);
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        // The value buffer is all-zero apart from sources; gate slots have
+        // never been evaluated. Seed every gate once so the first tick
+        // settles the whole circuit.
+        for slot in self.tape.gate_start..self.tape.slot_count() as u32 {
+            self.enqueue(slot);
+        }
     }
 
     #[inline]

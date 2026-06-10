@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use ryzr_backend::{BatchEngine, Engine, EventEngine, ScalarEngine};
+use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
 use ryzr_core::{Circuit, CircuitBuilder};
 
 #[cfg(all(feature = "jit", feature = "rayon"))]
@@ -58,20 +58,23 @@ fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
         Box::new(ScalarEngine::new(circuit)),
         Box::new(EventEngine::new(circuit)),
         Box::new(BatchEngine::new(circuit)),
+        Box::new(PackedEngine::new(circuit)),
         #[cfg(feature = "rayon")]
         Box::new(ThreadedEngine::new(circuit)),
         #[cfg(feature = "jit")]
         Box::new(JitEngine::new(circuit)),
         #[cfg(all(feature = "jit", feature = "rayon"))]
         Box::new(HybridEngine::new(circuit)),
+        #[cfg(all(feature = "jit", feature = "rayon"))]
+        Box::new(HybridEngine::wide(circuit)),
     ]
 }
 
-/// SWAR engines simulate 64 instances per tick; scale the element count so
-/// elem/s means instance-ticks/s for every engine.
+/// 64-instance SWAR engines simulate 64 instances per tick; scale the
+/// element count so elem/s means instance-ticks/s for every engine.
 fn lanes_of(engine: &dyn Engine) -> u64 {
     match engine.name() {
-        "batch64" | "hybrid" => 64,
+        "batch64" | "hybrid64" => 64,
         _ => 1,
     }
 }

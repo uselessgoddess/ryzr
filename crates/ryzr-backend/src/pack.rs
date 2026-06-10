@@ -302,7 +302,7 @@ impl PackedEngine {
     }
 
     /// Restore power-on state: register initials latched, inputs low.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.bits.fill(0);
         self.staging.copy_from_slice(&self.reg_init);
         self.bits[self.reg_word..self.reg_word + self.staging.len()].copy_from_slice(&self.staging);

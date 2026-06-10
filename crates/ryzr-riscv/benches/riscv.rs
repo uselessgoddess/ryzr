@@ -4,7 +4,8 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ryzr_backend::{
-    BatchEngine, Engine, EventEngine, HybridEngine, JitEngine, ScalarEngine, ThreadedEngine,
+    BatchEngine, Engine, EventEngine, HybridEngine, JitEngine, PackedEngine, ScalarEngine,
+    ThreadedEngine,
 };
 use ryzr_core::Circuit;
 use ryzr_riscv::{build_cpu, programs};
@@ -15,9 +16,11 @@ fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
         Box::new(ScalarEngine::new(circuit)),
         Box::new(EventEngine::new(circuit)),
         Box::new(BatchEngine::new(circuit)),
+        Box::new(PackedEngine::new(circuit)),
         Box::new(ThreadedEngine::new(circuit)),
         Box::new(JitEngine::new(circuit)),
         Box::new(HybridEngine::new(circuit)),
+        Box::new(HybridEngine::wide(circuit)),
     ]
 }
 
@@ -25,10 +28,11 @@ fn bench_riscv(c: &mut Criterion) {
     let circuit = build_cpu(&programs::fib_forever(), 256);
     let mut group = c.benchmark_group("riscv");
     for mut engine in engines(&circuit) {
-        // SWAR engines retire one instruction per lane per tick, so scale
-        // the element count to keep elem/s = instructions/s everywhere.
+        // 64-instance SWAR engines retire one instruction per lane per
+        // tick, so scale the element count to keep elem/s = instructions/s
+        // everywhere.
         let lanes = match engine.name() {
-            "batch64" | "hybrid" => 64,
+            "batch64" | "hybrid64" => 64,
             _ => 1,
         };
         group.throughput(Throughput::Elements(lanes));

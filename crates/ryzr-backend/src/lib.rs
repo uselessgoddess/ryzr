@@ -20,7 +20,7 @@
 //! | [`PackedEngine`] | one instance bit-packed: up to 64 same-op gates per word op |
 //! | [`JitEngine`] | tick compiled to native code via Cranelift |
 //! | [`ThreadedEngine`] | level-parallel work distribution via rayon |
-//! | [`HybridEngine`] | every technique above; fastest plan picked by on-circuit measurement |
+//! | [`HybridEngine`] | every technique above behind one type; fastest plan picked by racing them on the live circuit |
 
 mod batch;
 pub mod compile;

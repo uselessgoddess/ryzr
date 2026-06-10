@@ -110,8 +110,8 @@ fn check_engine(circuit: &Circuit, engine: &mut dyn Engine, rng: &mut Rng, ticks
     }
 }
 
-/// Hybrid engine with a forced plan; threshold 4 forces the parallel path
-/// even on tiny circuits.
+/// Wide-mode hybrid engine with a forced plan; threshold 4 forces the
+/// parallel path even on tiny circuits.
 #[cfg(all(feature = "jit", feature = "rayon"))]
 fn hybrid(circuit: &Circuit, threshold: usize, strategy: Strategy) -> HybridEngine {
     HybridEngine::with_config(std::sync::Arc::new(Compiled::new(circuit)), threshold, strategy)
@@ -127,7 +127,10 @@ fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
         Box::new(ThreadedEngine::new(circuit).with_threshold(4)),
         #[cfg(feature = "jit")]
         Box::new(JitEngine::new(circuit)),
-        // Both hybrid plans must match the oracle, so pin each explicitly
+        // The single-instance racer: whichever candidate wins must match.
+        #[cfg(all(feature = "jit", feature = "rayon"))]
+        Box::new(HybridEngine::new(circuit)),
+        // Both wide plans must match the oracle, so pin each explicitly
         // instead of letting auto-tuning pick one.
         #[cfg(all(feature = "jit", feature = "rayon"))]
         Box::new(hybrid(circuit, 4, Strategy::Jit)),

@@ -45,6 +45,12 @@ impl ThreadedEngine {
         self.parallel_threshold = threshold.max(1);
         self
     }
+
+    /// Restore power-on state: constants, register initials, inputs low.
+    pub(crate) fn reset(&mut self) {
+        self.values = self.tape.initial_values();
+        self.reg_scratch.copy_from_slice(&self.tape.reg_initial);
+    }
 }
 
 #[inline(always)]

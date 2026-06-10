@@ -147,6 +147,12 @@ impl JitEngine {
         let reg_scratch = tape.reg_initial.clone();
         Self { tape, values, reg_scratch, fns, module: Some(module) }
     }
+
+    /// Restore power-on state: constants, register initials, inputs low.
+    pub(crate) fn reset(&mut self) {
+        self.values = self.tape.initial_values();
+        self.reg_scratch.copy_from_slice(&self.tape.reg_initial);
+    }
 }
 
 /// Emit one chunk: a straight-line function evaluating gate slots

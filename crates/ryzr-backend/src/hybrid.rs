@@ -1,36 +1,48 @@
-//! The unified engine: SWAR × rayon × JIT, with the plan picked by
-//! measurement.
+//! The unified engine: every technique in the crate behind one type, with
+//! the plan picked by measurement instead of guesswork.
 //!
-//! Each technique multiplies a different axis, and they compose because
-//! they are orthogonal:
+//! [`HybridEngine::new`] simulates **one** circuit instance — the mode that
+//! answers "how fast can a single simulated CPU run?". No formula predicts
+//! which strategy wins that race: it depends on circuit shape, switching
+//! activity, cache sizes, and core count. So the constructor settles it the
+//! honest way — it builds every single-instance candidate, times each on
+//! the live circuit for a fraction of a millisecond, keeps the winner, and
+//! drops the rest:
 //!
-//! - **SWAR** packs 64 independent circuit instances into every `u64`
-//!   value slot, dividing the per-gate cost by 64 (same lane discipline as
-//!   [`BatchEngine`](crate::BatchEngine)).
-//! - **rayon** fans wide levels out across cores. Gates within a level are
-//!   independent by construction, so a wide level splits into disjoint
-//!   pieces that run concurrently; each writes only its own slot range and
-//!   reads only strictly lower levels.
-//! - **JIT** compiles the settle pass to straight-line native code with
-//!   operand offsets baked in as immediates, eliminating interpreter
-//!   dispatch and keeping hot intermediates in registers (same chunking as
-//!   [`JitEngine`](crate::JitEngine), but on 64-bit words).
+//! - **packed SWAR** ([`PackedEngine`]) batches up to 64 same-op gates of
+//!   the one instance into every word operation; wins on dense,
+//!   always-active logic like CPU datapaths.
+//! - **JIT** ([`JitEngine`]) compiles the settle pass to straight-line
+//!   native code; wins while the emitted code still fits in instruction
+//!   cache.
+//! - **event-driven** ([`EventEngine`]) pays per *changed* gate, not per
+//!   gate; wins on mostly-idle circuits.
+//! - **level-parallel** ([`ThreadedEngine`]) fans wide levels across cores
+//!   via rayon; wins when individual levels are tens of thousands of gates
+//!   wide.
 //!
-//! JIT is a trade, not a free win: straight-line code spends instruction
-//! bytes on every gate, so past a few thousand gates the settle stops
-//! fitting in instruction cache and each tick streams the whole program
-//! from memory. At that point the SWAR interpreter's tiny resident loop
-//! wins — its "program" is the tape's index arrays, which flow through the
-//! data prefetcher instead of the front end. Where the crossover sits
-//! depends on the circuit and the host, so [`Strategy::Auto`] (the
-//! default) settles it the honest way: build both plans, time each on the
-//! live circuit for a fraction of a millisecond, keep the faster one.
+//! Calibration runs the circuit from power-on state with inputs held low,
+//! so activity-dependent plans are measured under that workload; whatever
+//! wins, the results stay bit-for-bit identical.
 //!
-//! Either plan merges consecutive narrow levels into serial sections (a
-//! per-level rayon barrier costs microseconds — ruinous at millions of
+//! [`HybridEngine::wide`] is the throughput mode: 64 *independent*
+//! instances bit-packed into every `u64` slot (same lane discipline as
+//! [`BatchEngine`](crate::BatchEngine)), with rayon fanning wide levels
+//! across cores and the settle either jitted or interpreted. JIT is a
+//! trade, not a free win: straight-line code spends instruction bytes on
+//! every gate, so past a few thousand gates the settle stops fitting in
+//! instruction cache and each tick streams the whole program from memory.
+//! At that point the SWAR interpreter's tiny resident loop wins — its
+//! "program" is the tape's index arrays, which flow through the data
+//! prefetcher instead of the front end. Where the crossover sits depends on
+//! the circuit and the host, so [`Strategy::Auto`] (the default) races both
+//! plans the same way the single-instance mode races its candidates.
+//!
+//! Either wide plan merges consecutive narrow levels into serial sections
+//! (a per-level rayon barrier costs microseconds — ruinous at millions of
 //! ticks per second) and fans out only levels wider than the threshold.
 //! Per instance the results are bit-for-bit identical to every other
-//! engine under either plan; there are no semantic shortcuts anywhere.
+//! engine under any plan; there are no semantic shortcuts anywhere.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,17 +50,17 @@ use std::time::{Duration, Instant};
 use cranelift_jit::JITModule;
 use rayon::prelude::*;
 
-use crate::Engine;
 use crate::batch::{apply_edge, capture_next, eval_gate, eval_runs};
 use crate::compile::Compiled;
 use crate::jit::{CHUNK, TickFn, compile_ranges};
+use crate::{Engine, EventEngine, JitEngine, PackedEngine, ThreadedEngine};
 
 pub const LANES: usize = 64;
 
 /// Minimum level width (in gates) before the level is split across threads.
 const PARALLEL_THRESHOLD: usize = 1 << 15;
 
-/// How the hybrid engine executes the combinational settle.
+/// How the wide (64-lane) engine executes the combinational settle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
     /// Build both plans, time each on the live circuit, keep the faster.
@@ -57,6 +69,90 @@ pub enum Strategy {
     Jit,
     /// Force the SWAR-interpreted plan.
     Interpret,
+}
+
+/// Average tick latency over a short timed burst: a couple of warmup
+/// ticks, then ~500µs (capped at 4096 ticks) of measurement.
+fn time_per_tick(mut tick: impl FnMut()) -> Duration {
+    tick();
+    tick();
+    let start = Instant::now();
+    let mut ticks = 0u32;
+    loop {
+        for _ in 0..4 {
+            tick();
+        }
+        ticks += 4;
+        let elapsed = start.elapsed();
+        if elapsed >= Duration::from_micros(500) || ticks >= 4096 {
+            return elapsed / ticks;
+        }
+    }
+}
+
+/// The single-instance candidates. Every variant produces bit-for-bit
+/// identical results; only speed differs, so the constructor races them on
+/// the live circuit and keeps exactly one.
+enum Single {
+    Packed(PackedEngine),
+    Event(EventEngine),
+    Threaded(ThreadedEngine),
+    Jit(JitEngine),
+}
+
+impl Single {
+    fn engine(&self) -> &dyn Engine {
+        match self {
+            Self::Packed(e) => e,
+            Self::Event(e) => e,
+            Self::Threaded(e) => e,
+            Self::Jit(e) => e,
+        }
+    }
+
+    fn engine_mut(&mut self) -> &mut dyn Engine {
+        match self {
+            Self::Packed(e) => e,
+            Self::Event(e) => e,
+            Self::Threaded(e) => e,
+            Self::Jit(e) => e,
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Packed(e) => e.reset(),
+            Self::Event(e) => e.reset(),
+            Self::Threaded(e) => e.reset(),
+            Self::Jit(e) => e.reset(),
+        }
+    }
+}
+
+/// Race every single-instance candidate on the live circuit and return the
+/// winner, restored to power-on state (racing advances the simulation, so
+/// the winner is reset before use).
+fn race_single(tape: &Arc<Compiled>, threshold: usize) -> Single {
+    let mut candidates = vec![
+        Single::Packed(PackedEngine::with_tape(tape)),
+        Single::Event(EventEngine::with_tape(tape.clone())),
+        Single::Threaded(ThreadedEngine::with_tape(tape.clone()).with_threshold(threshold)),
+    ];
+    // Oversized circuits can't be jitted (slot offsets exceed i32).
+    if i32::try_from(tape.slot_count()).is_ok() {
+        candidates.push(Single::Jit(JitEngine::with_tape(tape.clone())));
+    }
+
+    let mut best: Option<(Duration, Single)> = None;
+    for mut candidate in candidates {
+        let t = time_per_tick(|| candidate.engine_mut().tick());
+        if best.as_ref().is_none_or(|&(b, _)| t < b) {
+            best = Some((t, candidate));
+        }
+    }
+    let (_, mut winner) = best.expect("candidate list is never empty");
+    winner.reset();
+    winner
 }
 
 /// One step of the baked jitted plan.
@@ -93,9 +189,9 @@ impl Drop for JitPlan {
     }
 }
 
-/// How one tick's settle runs. [`Plan::Interp`] carries no data: it walks
-/// the tape directly — narrow levels through the run interpreter, wide
-/// levels fanned out per gate.
+/// How one wide tick's settle runs. [`Plan::Interp`] carries no data: it
+/// walks the tape directly — narrow levels through the run interpreter,
+/// wide levels fanned out per gate.
 enum Plan {
     Jit(Box<JitPlan>),
     Interp,
@@ -118,7 +214,8 @@ impl SyncPtr {
 // the same step writes. Distinct steps are separated by rayon joins.
 unsafe impl Sync for SyncPtr {}
 
-pub struct HybridEngine {
+/// The wide mode: 64 independent SWAR-packed instances per value slot.
+struct Wide {
     tape: Arc<Compiled>,
     values: Vec<u64>,
     reg_scratch: Vec<u64>,
@@ -130,23 +227,8 @@ pub struct HybridEngine {
     has_wide: bool,
 }
 
-impl HybridEngine {
-    pub fn new(circuit: &ryzr_core::Circuit) -> Self {
-        Self::with_tape(Arc::new(Compiled::new(circuit)))
-    }
-
-    pub fn with_tape(tape: Arc<Compiled>) -> Self {
-        Self::with_config(tape, PARALLEL_THRESHOLD, Strategy::Auto)
-    }
-
-    /// Like [`new`](Self::new), but with a custom width at which a level is
-    /// split across threads. Mostly useful for testing the parallel path on
-    /// small circuits.
-    pub fn with_parallel_threshold(circuit: &ryzr_core::Circuit, threshold: usize) -> Self {
-        Self::with_config(Arc::new(Compiled::new(circuit)), threshold, Strategy::Auto)
-    }
-
-    pub fn with_config(tape: Arc<Compiled>, threshold: usize, strategy: Strategy) -> Self {
+impl Wide {
+    fn build(tape: Arc<Compiled>, threshold: usize, strategy: Strategy) -> Self {
         let threshold = threshold.max(1);
         let n = tape.slot_count();
         let fits_jit = n.checked_mul(8).is_some_and(|bytes| i32::try_from(bytes).is_ok());
@@ -165,7 +247,7 @@ impl HybridEngine {
         };
         let race = matches!(strategy, Strategy::Auto) && matches!(plan, Plan::Jit(_));
 
-        let mut engine = Self {
+        let mut wide = Self {
             values: vec![0; n],
             reg_scratch: vec![0; tape.register_count()],
             tape,
@@ -173,11 +255,11 @@ impl HybridEngine {
             threshold,
             has_wide,
         };
-        engine.reset();
+        wide.reset();
         if race {
-            engine.calibrate();
+            wide.calibrate();
         }
-        engine
+        wide
     }
 
     /// Restore power-on state: constants, register initials, inputs low.
@@ -200,9 +282,9 @@ impl HybridEngine {
     /// only from [`Strategy::Auto`] construction with the jitted plan built.
     fn calibrate(&mut self) {
         let jit = core::mem::replace(&mut self.plan, Plan::Interp);
-        let interpreted = self.time_per_tick();
+        let interpreted = time_per_tick(|| self.tick());
         self.plan = jit;
-        let jitted = self.time_per_tick();
+        let jitted = time_per_tick(|| self.tick());
         if interpreted < jitted {
             // Dropping the jitted plan frees its executable memory.
             self.plan = Plan::Interp;
@@ -210,31 +292,11 @@ impl HybridEngine {
         self.reset();
     }
 
-    /// Average tick latency over a short timed burst: a couple of warmup
-    /// ticks, then ~500µs (capped at 4096 ticks) of measurement.
-    fn time_per_tick(&mut self) -> Duration {
-        self.tick();
-        self.tick();
-        let start = Instant::now();
-        let mut ticks = 0u32;
-        loop {
-            for _ in 0..4 {
-                self.tick();
-            }
-            ticks += 4;
-            let elapsed = start.elapsed();
-            if elapsed >= Duration::from_micros(500) || ticks >= 4096 {
-                return elapsed / ticks;
-            }
-        }
-    }
-
-    /// Set one input across all 64 instances at once (bit k = instance k).
-    pub fn set_input_mask(&mut self, index: usize, mask: u64) {
+    fn set_input_mask(&mut self, index: usize, mask: u64) {
         self.values[self.tape.input_slots[index] as usize] = mask;
     }
 
-    pub fn set_input_lane(&mut self, index: usize, lane: usize, value: bool) {
+    fn set_input_lane(&mut self, index: usize, lane: usize, value: bool) {
         debug_assert!(lane < LANES);
         let slot = self.tape.input_slots[index] as usize;
         let bit = 1u64 << lane;
@@ -245,90 +307,8 @@ impl HybridEngine {
         }
     }
 
-    pub fn output_mask(&self, index: usize) -> u64 {
+    fn output_mask(&self, index: usize) -> u64 {
         self.values[self.tape.output_slots[index] as usize]
-    }
-
-    pub fn output_lane(&self, index: usize, lane: usize) -> bool {
-        debug_assert!(lane < LANES);
-        self.output_mask(index) >> lane & 1 != 0
-    }
-}
-
-/// Compile the settle pass: serial chunks over narrow levels, per-thread
-/// pieces over levels at least `threshold` gates wide.
-fn build_jit_plan(tape: &Compiled, threshold: usize) -> JitPlan {
-    let chunks = |start: usize, end: usize| {
-        let mut pieces = Vec::new();
-        let mut s = start;
-        while s < end {
-            let e = usize::min(s + CHUNK, end);
-            pieces.push(s..e);
-            s = e;
-        }
-        pieces
-    };
-
-    let n = tape.slot_count();
-    let mut spec: Vec<Spec> = Vec::new();
-    let mut serial_start = tape.gate_start as usize;
-    for level in &tape.levels {
-        let width = (level.end - level.start) as usize;
-        if width < threshold {
-            continue;
-        }
-        spec.extend(chunks(serial_start, level.start as usize).into_iter().map(Spec::Serial));
-        spec.push(Spec::Parallel(chunks(level.start as usize, level.end as usize)));
-        serial_start = level.end as usize;
-    }
-    spec.extend(chunks(serial_start, n).into_iter().map(Spec::Serial));
-
-    let flat: Vec<core::ops::Range<usize>> = spec
-        .iter()
-        .flat_map(|s| match s {
-            Spec::Serial(range) => core::slice::from_ref(range),
-            Spec::Parallel(ranges) => ranges.as_slice(),
-        })
-        .cloned()
-        .collect();
-    let (module, fns) = compile_ranges(tape, &flat, true);
-
-    let mut fns = fns.into_iter();
-    let steps = spec
-        .into_iter()
-        .map(|s| match s {
-            Spec::Serial(_) => Step::Serial(fns.next().unwrap()),
-            Spec::Parallel(ranges) => {
-                Step::Parallel(ranges.iter().map(|_| fns.next().unwrap()).collect())
-            }
-        })
-        .collect();
-
-    JitPlan { steps, module: Some(module) }
-}
-
-impl Engine for HybridEngine {
-    fn name(&self) -> &'static str {
-        "hybrid"
-    }
-
-    fn input_count(&self) -> usize {
-        self.tape.input_count()
-    }
-
-    fn output_count(&self) -> usize {
-        self.tape.output_count()
-    }
-
-    /// Broadcasts to all 64 lanes; use [`set_input_lane`](Self::set_input_lane)
-    /// for per-instance control.
-    fn set_input(&mut self, index: usize, value: bool) {
-        self.set_input_mask(index, if value { u64::MAX } else { 0 });
-    }
-
-    /// Reads lane 0.
-    fn output(&self, index: usize) -> bool {
-        self.output_lane(index, 0)
     }
 
     fn tick(&mut self) {
@@ -384,5 +364,188 @@ impl Engine for HybridEngine {
         }
 
         capture_next(tape, values, reg_scratch);
+    }
+}
+
+/// Compile the settle pass: serial chunks over narrow levels, per-thread
+/// pieces over levels at least `threshold` gates wide.
+fn build_jit_plan(tape: &Compiled, threshold: usize) -> JitPlan {
+    let chunks = |start: usize, end: usize| {
+        let mut pieces = Vec::new();
+        let mut s = start;
+        while s < end {
+            let e = usize::min(s + CHUNK, end);
+            pieces.push(s..e);
+            s = e;
+        }
+        pieces
+    };
+
+    let n = tape.slot_count();
+    let mut spec: Vec<Spec> = Vec::new();
+    let mut serial_start = tape.gate_start as usize;
+    for level in &tape.levels {
+        let width = (level.end - level.start) as usize;
+        if width < threshold {
+            continue;
+        }
+        spec.extend(chunks(serial_start, level.start as usize).into_iter().map(Spec::Serial));
+        spec.push(Spec::Parallel(chunks(level.start as usize, level.end as usize)));
+        serial_start = level.end as usize;
+    }
+    spec.extend(chunks(serial_start, n).into_iter().map(Spec::Serial));
+
+    let flat: Vec<core::ops::Range<usize>> = spec
+        .iter()
+        .flat_map(|s| match s {
+            Spec::Serial(range) => core::slice::from_ref(range),
+            Spec::Parallel(ranges) => ranges.as_slice(),
+        })
+        .cloned()
+        .collect();
+    let (module, fns) = compile_ranges(tape, &flat, true);
+
+    let mut fns = fns.into_iter();
+    let steps = spec
+        .into_iter()
+        .map(|s| match s {
+            Spec::Serial(_) => Step::Serial(fns.next().unwrap()),
+            Spec::Parallel(ranges) => {
+                Step::Parallel(ranges.iter().map(|_| fns.next().unwrap()).collect())
+            }
+        })
+        .collect();
+
+    JitPlan { steps, module: Some(module) }
+}
+
+enum Mode {
+    Single(Single),
+    Wide(Box<Wide>),
+}
+
+pub struct HybridEngine {
+    mode: Mode,
+}
+
+impl HybridEngine {
+    /// One simulated instance, run by the fastest single-instance plan —
+    /// picked by racing every candidate on the live circuit.
+    pub fn new(circuit: &ryzr_core::Circuit) -> Self {
+        Self::with_tape(Arc::new(Compiled::new(circuit)))
+    }
+
+    /// Single-instance mode from an already-compiled tape.
+    pub fn with_tape(tape: Arc<Compiled>) -> Self {
+        Self { mode: Mode::Single(race_single(&tape, PARALLEL_THRESHOLD)) }
+    }
+
+    /// Like [`new`](Self::new), but with a custom width at which the
+    /// level-parallel candidate splits a level across threads. Mostly
+    /// useful for exercising the parallel path on small circuits.
+    pub fn with_parallel_threshold(circuit: &ryzr_core::Circuit, threshold: usize) -> Self {
+        let tape = Arc::new(Compiled::new(circuit));
+        Self { mode: Mode::Single(race_single(&tape, threshold.max(1))) }
+    }
+
+    /// The wide mode: 64 independent instances bit-packed per value slot,
+    /// fastest settle plan picked by measurement. Drive the lanes through
+    /// the mask APIs ([`set_input_mask`](Self::set_input_mask),
+    /// [`output_mask`](Self::output_mask), and the per-lane variants).
+    pub fn wide(circuit: &ryzr_core::Circuit) -> Self {
+        Self::with_config(Arc::new(Compiled::new(circuit)), PARALLEL_THRESHOLD, Strategy::Auto)
+    }
+
+    /// Wide mode with full control over the rayon threshold and the settle
+    /// strategy.
+    pub fn with_config(tape: Arc<Compiled>, threshold: usize, strategy: Strategy) -> Self {
+        Self { mode: Mode::Wide(Box::new(Wide::build(tape, threshold, strategy))) }
+    }
+
+    fn wide_ref(&self) -> &Wide {
+        match &self.mode {
+            Mode::Wide(wide) => wide,
+            Mode::Single(_) => panic!(
+                "lane APIs need the wide engine; construct with HybridEngine::wide or with_config"
+            ),
+        }
+    }
+
+    fn wide_mut(&mut self) -> &mut Wide {
+        match &mut self.mode {
+            Mode::Wide(wide) => wide,
+            Mode::Single(_) => panic!(
+                "lane APIs need the wide engine; construct with HybridEngine::wide or with_config"
+            ),
+        }
+    }
+
+    /// Set one input across all 64 instances at once (bit k = instance k).
+    /// Wide mode only.
+    pub fn set_input_mask(&mut self, index: usize, mask: u64) {
+        self.wide_mut().set_input_mask(index, mask);
+    }
+
+    /// Wide mode only.
+    pub fn set_input_lane(&mut self, index: usize, lane: usize, value: bool) {
+        self.wide_mut().set_input_lane(index, lane, value);
+    }
+
+    /// Wide mode only.
+    pub fn output_mask(&self, index: usize) -> u64 {
+        self.wide_ref().output_mask(index)
+    }
+
+    /// Wide mode only.
+    pub fn output_lane(&self, index: usize, lane: usize) -> bool {
+        debug_assert!(lane < LANES);
+        self.output_mask(index) >> lane & 1 != 0
+    }
+}
+
+impl Engine for HybridEngine {
+    fn name(&self) -> &'static str {
+        match &self.mode {
+            Mode::Single(_) => "hybrid",
+            Mode::Wide(_) => "hybrid64",
+        }
+    }
+
+    fn input_count(&self) -> usize {
+        match &self.mode {
+            Mode::Single(single) => single.engine().input_count(),
+            Mode::Wide(wide) => wide.tape.input_count(),
+        }
+    }
+
+    fn output_count(&self) -> usize {
+        match &self.mode {
+            Mode::Single(single) => single.engine().output_count(),
+            Mode::Wide(wide) => wide.tape.output_count(),
+        }
+    }
+
+    /// Wide mode broadcasts to all 64 lanes; use
+    /// [`set_input_lane`](Self::set_input_lane) for per-instance control.
+    fn set_input(&mut self, index: usize, value: bool) {
+        match &mut self.mode {
+            Mode::Single(single) => single.engine_mut().set_input(index, value),
+            Mode::Wide(wide) => wide.set_input_mask(index, if value { u64::MAX } else { 0 }),
+        }
+    }
+
+    /// Wide mode reads lane 0.
+    fn output(&self, index: usize) -> bool {
+        match &self.mode {
+            Mode::Single(single) => single.engine().output(index),
+            Mode::Wide(wide) => wide.output_mask(index) & 1 != 0,
+        }
+    }
+
+    fn tick(&mut self) {
+        match &mut self.mode {
+            Mode::Single(single) => single.engine_mut().tick(),
+            Mode::Wide(wide) => wide.tick(),
+        }
     }
 }
