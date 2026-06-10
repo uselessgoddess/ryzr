@@ -34,7 +34,7 @@ use crate::compile::{Compiled, Op};
 use crate::pack::{OutSrc, Plan, Seg};
 
 /// Tasks per jitted function; bounds compile time on huge circuits.
-const CHUNK: usize = 512;
+const CHUNK: usize = 2048;
 
 /// `fn(bits, staging)`: settle a chunk of tasks; the last chunk also
 /// captures register next-state into `staging`.
