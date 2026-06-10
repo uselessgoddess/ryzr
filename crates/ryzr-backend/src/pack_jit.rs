@@ -31,7 +31,7 @@ use cranelift_module::{Linkage, Module};
 
 use crate::Engine;
 use crate::compile::{Compiled, Op};
-use crate::pack::{OutSrc, Plan, Seg};
+use crate::pack::{OutSrc, Plan, Seg, TaskOp};
 
 /// Tasks per jitted function; bounds compile time on huge circuits.
 const CHUNK: usize = 2048;
@@ -181,24 +181,34 @@ impl PackedJitEngine {
 
                 let a = emit.gather(sa, sr[0].funnels as usize, task.imm[0]);
                 let word = match task.op {
-                    Op::Not => emit.fb.ins().bnot(a),
-                    Op::Buf => a,
-                    Op::And | Op::Or | Op::Xor | Op::Nand | Op::Nor | Op::Xnor => {
+                    TaskOp::Gate(Op::Not) => emit.fb.ins().bnot(a),
+                    TaskOp::Gate(Op::Buf) => a,
+                    TaskOp::Gate(
+                        op @ (Op::And | Op::Or | Op::Xor | Op::Nand | Op::Nor | Op::Xnor),
+                    ) => {
                         let b = emit.gather(sb, sr[1].funnels as usize, task.imm[1]);
-                        let raw = match task.op {
+                        let raw = match op {
                             Op::And | Op::Nand => emit.fb.ins().band(a, b),
                             Op::Or | Op::Nor => emit.fb.ins().bor(a, b),
                             _ => emit.fb.ins().bxor(a, b),
                         };
-                        match task.op {
+                        match op {
                             Op::Nand | Op::Nor | Op::Xnor => emit.fb.ins().bnot(raw),
                             _ => raw,
                         }
                     }
-                    Op::Mux => {
+                    TaskOp::Gate(Op::Mux) => {
                         let b = emit.gather(sb, sr[1].funnels as usize, task.imm[1]);
                         let c = emit.gather(sc, sr[2].funnels as usize, task.imm[2]);
                         emit.fb.ins().bitselect(a, b, c)
+                    }
+                    // Fused ripple chain: one native add propagates the
+                    // carry through all lanes (carry-out at bit `len`).
+                    TaskOp::Add => {
+                        let b = emit.gather(sb, sr[1].funnels as usize, task.imm[1]);
+                        let c = emit.gather(sc, sr[2].funnels as usize, task.imm[2]);
+                        let ab = emit.fb.ins().iadd(a, b);
+                        emit.fb.ins().iadd(ab, c)
                     }
                 };
                 emit.fb.ins().store(MemFlags::trusted(), word, emit.base, (task.dst as i32) * 8);

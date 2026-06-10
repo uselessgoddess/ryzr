@@ -25,6 +25,7 @@
 mod batch;
 pub mod compile;
 mod event;
+mod fuse;
 #[cfg(all(feature = "jit", feature = "rayon"))]
 mod hybrid;
 #[cfg(feature = "jit")]

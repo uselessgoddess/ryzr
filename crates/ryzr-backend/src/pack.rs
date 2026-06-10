@@ -37,6 +37,7 @@
 
 use crate::Engine;
 use crate::compile::{Compiled, Op, arity};
+use crate::fuse::{Chain, find_chains};
 
 /// Minimum contiguous run length worth a funnel shift; shorter runs join
 /// the splat groups (measured on the RV32I core: 2..=8 are within noise,
@@ -62,10 +63,19 @@ pub(crate) struct StreamRef {
     pub(crate) splats: u8,
 }
 
+/// Word-level operation of a task: an ordinary boolean gate word, or a
+/// fused ripple-carry chain evaluated as one native add (see [`crate::fuse`]).
+#[derive(Clone, Copy)]
+pub(crate) enum TaskOp {
+    Gate(Op),
+    /// `dst = a + b + c`: sums in bits `0..len`, carry-out at bit `len`.
+    Add,
+}
+
 /// One output word: up to 64 same-op gates of one run.
 #[derive(Clone, Copy)]
 pub(crate) struct Task {
-    pub(crate) op: Op,
+    pub(crate) op: TaskOp,
     /// Destination word index in the arena.
     pub(crate) dst: u32,
     pub(crate) streams: [StreamRef; 3],
@@ -78,6 +88,15 @@ pub(crate) struct Task {
 pub(crate) enum OutSrc {
     Bit(u32),
     Const(bool),
+}
+
+/// Destination words of one fused chain: the sum word (sum bit i of link
+/// i, carry-out at bit `len`), and the whole `P ^ Q` / `P & Q` words when
+/// CSE let some pxq / g escape the chain (`u32::MAX` when not needed).
+struct ChainDst {
+    sum: u32,
+    pxq: u32,
+    g: u32,
 }
 
 /// The complete word-level execution plan: arena layout, gather programs
@@ -121,6 +140,12 @@ fn plan_stream(window: &[u32], pos: &[u32], cval: &[u8], segs: &mut Vec<Seg>) ->
     let mut covered = 0u64;
 
     for (i, &slot) in window.iter().enumerate() {
+        // `u32::MAX` marks an absent operand (an incrementer link's zero
+        // q-bit inside a fused chain): constant zero, nothing to gather.
+        if slot == u32::MAX {
+            covered |= 1 << i;
+            continue;
+        }
         let v = cval[slot as usize];
         if v != u8::MAX {
             covered |= 1 << i;
@@ -205,6 +230,10 @@ impl Plan {
     pub(crate) fn new(tape: &Compiled) -> Self {
         let n = tape.slot_count();
 
+        // Recognize ripple-carry adders first: their gates leave the window
+        // pipeline entirely and settle as native word adds instead.
+        let (chains, fused) = find_chains(tape);
+
         // Constant values per slot; u8::MAX = not a constant.
         let mut cval = vec![u8::MAX; n];
         for &(slot, v) in &tape.const_slots {
@@ -212,8 +241,10 @@ impl Plan {
         }
 
         // Arena layout: [inputs][align][live register outputs][align]
-        // [gate runs, each word-aligned][pad word]. Constants get no
-        // position — every read of them folds into an immediate.
+        // [gate runs, each word-aligned][chain words][pad word]. Constants
+        // get no position — every read of them folds into an immediate.
+        // Fused gates are compacted out of their runs; the survivors of a
+        // run stay contiguous so funnels keep working across them.
         let mut pos = vec![u32::MAX; n];
         let mut bit = tape.input_slots.len() as u32;
         for (i, &slot) in tape.input_slots.iter().enumerate() {
@@ -229,35 +260,131 @@ impl Plan {
         }
         bit += live.len() as u32;
 
-        for run in &tape.runs {
-            bit = bit.next_multiple_of(64);
-            for slot in run.start..run.end {
-                pos[slot as usize] = bit + (slot - run.start);
+        let run_slots: Vec<Vec<u32>> = tape
+            .runs
+            .iter()
+            .map(|run| (run.start..run.end).filter(|&s| !fused[s as usize]).collect())
+            .collect();
+        for slots in &run_slots {
+            if slots.is_empty() {
+                continue;
             }
-            bit += run.end - run.start;
+            bit = bit.next_multiple_of(64);
+            for (i, &slot) in slots.iter().enumerate() {
+                pos[slot as usize] = bit + i as u32;
+            }
+            bit += slots.len() as u32;
         }
+
+        // Chain destinations: the add leaves the carry-out at bit `len`
+        // for free, so it needs no gate of its own.
+        let chain_dst: Vec<ChainDst> = chains
+            .iter()
+            .map(|chain| {
+                let len = chain.links.len() as u32;
+                bit = bit.next_multiple_of(64);
+                let sum = bit / 64;
+                for (i, link) in chain.links.iter().enumerate() {
+                    if link.sum != u32::MAX {
+                        pos[link.sum as usize] = bit + i as u32;
+                    }
+                }
+                pos[chain.links.last().expect("chains are non-empty").carry as usize] = bit + len;
+                bit += len + 1;
+                let mut side = |on: bool, field: fn(&crate::fuse::Link) -> u32| {
+                    if !on {
+                        return u32::MAX;
+                    }
+                    bit = bit.next_multiple_of(64);
+                    let word = bit / 64;
+                    for (i, link) in chain.links.iter().enumerate() {
+                        if field(link) != u32::MAX {
+                            pos[field(link) as usize] = bit + i as u32;
+                        }
+                    }
+                    bit += len;
+                    word
+                };
+                let pxq = side(chain.ext_pxq, |l| l.pxq);
+                let g = side(chain.ext_g, |l| l.g);
+                ChainDst { sum, pxq, g }
+            })
+            .collect();
         let words = bit.div_ceil(64) as usize + 1;
 
-        // Lower every 64-gate window of every run to a task.
+        // Lower every 64-gate window of every run to a task, interleaving
+        // each chain right before the windows of its `ready` level — by
+        // then all of its operands have settled, and everything that reads
+        // a chain output originally lived at level >= ready, so it still
+        // executes after (validated by the chain finder).
         let mut tasks = Vec::new();
         let mut segs = Vec::new();
-        for run in &tape.runs {
-            let ar = arity(run.op);
-            let mut s = run.start as usize;
-            while s < run.end as usize {
-                let e = usize::min(s + 64, run.end as usize);
-                let mut imm = [0u64; 3];
-                let mut streams = [StreamRef::default(); 3];
-                (imm[0], streams[0]) = plan_stream(&tape.a[s..e], &pos, &cval, &mut segs);
-                if ar > 1 {
-                    (imm[1], streams[1]) = plan_stream(&tape.b[s..e], &pos, &cval, &mut segs);
+
+        let mut chain_order: Vec<usize> = (0..chains.len()).collect();
+        chain_order.sort_by_key(|&i| chains[i].ready);
+        let mut next_chain = 0usize;
+        let emit_chain =
+            |chain: &Chain, dst: &ChainDst, tasks: &mut Vec<Task>, segs: &mut Vec<Seg>| {
+                let p: Vec<u32> = chain.links.iter().map(|l| l.p).collect();
+                let q: Vec<u32> = chain.links.iter().map(|l| l.q).collect();
+                let mut word_task = |op: TaskOp, dst: u32, windows: [&[u32]; 3]| {
+                    let mut imm = [0u64; 3];
+                    let mut streams = [StreamRef::default(); 3];
+                    for (k, window) in windows.iter().enumerate() {
+                        if !window.is_empty() {
+                            (imm[k], streams[k]) = plan_stream(window, &pos, &cval, segs);
+                        }
+                    }
+                    tasks.push(Task { op, dst, streams, imm });
+                };
+                if dst.pxq != u32::MAX {
+                    word_task(TaskOp::Gate(Op::Xor), dst.pxq, [&p, &q, &[]]);
                 }
-                if ar > 2 {
-                    (imm[2], streams[2]) = plan_stream(&tape.c[s..e], &pos, &cval, &mut segs);
+                if dst.g != u32::MAX {
+                    word_task(TaskOp::Gate(Op::And), dst.g, [&p, &q, &[]]);
                 }
-                tasks.push(Task { op: run.op, dst: pos[s] / 64, streams, imm });
-                s = e;
+                word_task(TaskOp::Add, dst.sum, [&p, &q, &[chain.cin]]);
+            };
+
+        for (lvl, level) in tape.levels.iter().enumerate() {
+            while next_chain < chain_order.len()
+                && chains[chain_order[next_chain]].ready <= lvl as u32
+            {
+                let c = chain_order[next_chain];
+                emit_chain(&chains[c], &chain_dst[c], &mut tasks, &mut segs);
+                next_chain += 1;
             }
+            let range = level.run_start as usize..level.run_end as usize;
+            for (slots, run) in run_slots[range.clone()].iter().zip(&tape.runs[range]) {
+                let op = run.op;
+                let ar = arity(op);
+                for chunk in slots.chunks(64) {
+                    let window =
+                        |sel: &[u32]| chunk.iter().map(|&s| sel[s as usize]).collect::<Vec<u32>>();
+                    let mut imm = [0u64; 3];
+                    let mut streams = [StreamRef::default(); 3];
+                    (imm[0], streams[0]) = plan_stream(&window(&tape.a), &pos, &cval, &mut segs);
+                    if ar > 1 {
+                        (imm[1], streams[1]) =
+                            plan_stream(&window(&tape.b), &pos, &cval, &mut segs);
+                    }
+                    if ar > 2 {
+                        (imm[2], streams[2]) =
+                            plan_stream(&window(&tape.c), &pos, &cval, &mut segs);
+                    }
+                    tasks.push(Task {
+                        op: TaskOp::Gate(op),
+                        dst: pos[chunk[0] as usize] / 64,
+                        streams,
+                        imm,
+                    });
+                }
+            }
+        }
+        while next_chain < chain_order.len() {
+            let c = chain_order[next_chain];
+            emit_chain(&chains[c], &chain_dst[c], &mut tasks, &mut segs);
+            next_chain += 1;
         }
 
         // Gather program for the register capture: live registers' next
@@ -268,6 +395,21 @@ impl Plan {
             let window: Vec<u32> = chunk.iter().map(|&r| tape.reg_in_slots[r]).collect();
             let (imm, sr) = plan_stream(&window, &pos, &cval, &mut cap_segs);
             capture.push((imm, sr));
+        }
+
+        // Diagnostics, default off: RYZR_PACK_STATS=1 prints plan shape.
+        if std::env::var_os("RYZR_PACK_STATS").is_some() {
+            let absorbed = fused.iter().filter(|&&f| f).count();
+            let links: usize = chains.iter().map(|c| c.links.len()).sum();
+            eprintln!(
+                "pack plan: {} tasks, {} segs, {} words; {} chains ({} links, {} gates absorbed)",
+                tasks.len(),
+                segs.len(),
+                words,
+                chains.len(),
+                links,
+                absorbed,
+            );
         }
 
         // Validate the gather SAFETY contract once, here.
@@ -378,18 +520,25 @@ impl Engine for PackedEngine {
 
             let a = gather(&self.bits, sa, fa, task.imm[0]);
             let word = match task.op {
-                Op::Not => !a,
-                Op::Buf => a,
-                Op::And => a & gather(&self.bits, sb, fb, task.imm[1]),
-                Op::Or => a | gather(&self.bits, sb, fb, task.imm[1]),
-                Op::Xor => a ^ gather(&self.bits, sb, fb, task.imm[1]),
-                Op::Nand => !(a & gather(&self.bits, sb, fb, task.imm[1])),
-                Op::Nor => !(a | gather(&self.bits, sb, fb, task.imm[1])),
-                Op::Xnor => !(a ^ gather(&self.bits, sb, fb, task.imm[1])),
-                Op::Mux => {
+                TaskOp::Gate(Op::Not) => !a,
+                TaskOp::Gate(Op::Buf) => a,
+                TaskOp::Gate(Op::And) => a & gather(&self.bits, sb, fb, task.imm[1]),
+                TaskOp::Gate(Op::Or) => a | gather(&self.bits, sb, fb, task.imm[1]),
+                TaskOp::Gate(Op::Xor) => a ^ gather(&self.bits, sb, fb, task.imm[1]),
+                TaskOp::Gate(Op::Nand) => !(a & gather(&self.bits, sb, fb, task.imm[1])),
+                TaskOp::Gate(Op::Nor) => !(a | gather(&self.bits, sb, fb, task.imm[1])),
+                TaskOp::Gate(Op::Xnor) => !(a ^ gather(&self.bits, sb, fb, task.imm[1])),
+                TaskOp::Gate(Op::Mux) => {
                     let b = gather(&self.bits, sb, fb, task.imm[1]);
                     let c = gather(&self.bits, sc, fc, task.imm[2]);
                     c ^ (a & (b ^ c))
+                }
+                // Fused ripple chain: the native add propagates the carry
+                // through all lanes; bit `len` is the chain's carry-out.
+                TaskOp::Add => {
+                    let b = gather(&self.bits, sb, fb, task.imm[1]);
+                    let c = gather(&self.bits, sc, fc, task.imm[2]);
+                    a.wrapping_add(b).wrapping_add(c)
                 }
             };
             self.bits[task.dst as usize] = word;
