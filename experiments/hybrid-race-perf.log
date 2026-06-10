@@ -1,0 +1,7 @@
+  scalar:      44961 instructions/s (one CPU)
+   event:      14157 instructions/s (one CPU)
+  packed:     183489 instructions/s (one CPU)
+packed-jit:     614035 instructions/s (one CPU)
+     jit:      53875 instructions/s (one CPU)
+  hybrid:     609239 instructions/s (one CPU)
+hybrid64:      50849 instructions/s (one CPU)

@@ -17,10 +17,11 @@
 //! | [`ScalarEngine`] | dense forward pass, per-run dispatch |
 //! | [`EventEngine`] | recomputes only the cone affected by actual changes |
 //! | [`BatchEngine`] | 64 independent instances bit-packed per word (SWAR) |
-//! | [`PackedEngine`] | one instance bit-packed: up to 64 same-op gates per word op |
-//! | [`JitEngine`] | tick compiled to native code via Cranelift |
+//! | [`PackedEngine`] | one instance bit-packed: up to 64 same-op gates per word op, fused carry chains as native adds |
+//! | [`PackedJitEngine`] | the packed plan compiled to native code via Cranelift — fastest single-instance engine |
+//! | [`JitEngine`] | per-gate tick compiled to native code via Cranelift |
 //! | [`ThreadedEngine`] | level-parallel work distribution via rayon |
-//! | [`HybridEngine`] | every technique above behind one type; fastest plan picked by racing them on the live circuit |
+//! | [`HybridEngine`] | one type over the winning set; fastest plan picked by racing the candidates on the live circuit |
 
 mod batch;
 pub mod compile;

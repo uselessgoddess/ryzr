@@ -9,17 +9,21 @@
 //! the live circuit for a fraction of a millisecond, keeps the winner, and
 //! drops the rest:
 //!
-//! - **packed SWAR** ([`PackedEngine`]) batches up to 64 same-op gates of
-//!   the one instance into every word operation; wins on dense,
-//!   always-active logic like CPU datapaths.
-//! - **JIT** ([`JitEngine`]) compiles the settle pass to straight-line
-//!   native code; wins while the emitted code still fits in instruction
-//!   cache.
+//! - **packed JIT** ([`PackedJitEngine`]) compiles the word-level packed
+//!   plan to native code; wins on dense, always-active logic like CPU
+//!   datapaths — by a wide margin.
+//! - **packed SWAR** ([`PackedEngine`]) interprets the same plan; the
+//!   cheap-to-construct fallback when compile time matters.
 //! - **event-driven** ([`EventEngine`]) pays per *changed* gate, not per
 //!   gate; wins on mostly-idle circuits.
 //! - **level-parallel** ([`ThreadedEngine`]) fans wide levels across cores
 //!   via rayon; wins when individual levels are tens of thousands of gates
 //!   wide.
+//!
+//! The per-gate [`JitEngine`](crate::JitEngine) is not raced: the packed
+//! JIT executes the same circuit in strictly fewer instructions, and no
+//! measured circuit shape has the per-gate plan winning. (Its compiler
+//! still powers this engine's wide-mode jitted settle below.)
 //!
 //! Calibration runs the circuit from power-on state with inputs held low,
 //! so activity-dependent plans are measured under that workload; whatever
@@ -53,7 +57,7 @@ use rayon::prelude::*;
 use crate::batch::{apply_edge, capture_next, eval_gate, eval_runs};
 use crate::compile::Compiled;
 use crate::jit::{CHUNK, TickFn, compile_ranges};
-use crate::{Engine, EventEngine, JitEngine, PackedEngine, ThreadedEngine};
+use crate::{Engine, EventEngine, PackedEngine, PackedJitEngine, ThreadedEngine};
 
 pub const LANES: usize = 64;
 
@@ -97,7 +101,7 @@ enum Single {
     Packed(PackedEngine),
     Event(EventEngine),
     Threaded(ThreadedEngine),
-    Jit(Box<JitEngine>),
+    PackedJit(Box<PackedJitEngine>),
 }
 
 impl Single {
@@ -106,7 +110,7 @@ impl Single {
             Self::Packed(e) => e,
             Self::Event(e) => e,
             Self::Threaded(e) => e,
-            Self::Jit(e) => e.as_ref(),
+            Self::PackedJit(e) => e.as_ref(),
         }
     }
 
@@ -115,7 +119,7 @@ impl Single {
             Self::Packed(e) => e,
             Self::Event(e) => e,
             Self::Threaded(e) => e,
-            Self::Jit(e) => e.as_mut(),
+            Self::PackedJit(e) => e.as_mut(),
         }
     }
 
@@ -124,7 +128,7 @@ impl Single {
             Self::Packed(e) => e.reset(),
             Self::Event(e) => e.reset(),
             Self::Threaded(e) => e.reset(),
-            Self::Jit(e) => e.reset(),
+            Self::PackedJit(e) => e.reset(),
         }
     }
 }
@@ -133,15 +137,14 @@ impl Single {
 /// winner, restored to power-on state (racing advances the simulation, so
 /// the winner is reset before use).
 fn race_single(tape: Arc<Compiled>, threshold: usize) -> Single {
-    let mut candidates = vec![
+    // The packed JIT has no size cliff: its offsets are word-granular, so
+    // any circuit whose plan fits the u32 bit arena compiles fine.
+    let candidates = vec![
         Single::Packed(PackedEngine::with_tape(&tape)),
+        Single::PackedJit(Box::new(PackedJitEngine::with_tape(&tape))),
         Single::Event(EventEngine::with_tape(tape.clone())),
-        Single::Threaded(ThreadedEngine::with_tape(tape.clone()).with_threshold(threshold)),
+        Single::Threaded(ThreadedEngine::with_tape(tape).with_threshold(threshold)),
     ];
-    // Oversized circuits can't be jitted (slot offsets exceed i32).
-    if i32::try_from(tape.slot_count()).is_ok() {
-        candidates.push(Single::Jit(Box::new(JitEngine::with_tape(tape))));
-    }
 
     let mut best: Option<(Duration, Single)> = None;
     for mut candidate in candidates {
