@@ -21,7 +21,7 @@ test *args:
     {{ test_runner }} --workspace --all-targets {{ args }}
 
 bench *args:
-    cargo bench -p shai {{ args }}
+    cargo bench --workspace {{ args }}
 
 build *args: fmt
     cargo build {{ args }}
