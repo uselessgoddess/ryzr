@@ -17,9 +17,10 @@
 //! | [`ScalarEngine`] | dense forward pass, per-run dispatch |
 //! | [`EventEngine`] | recomputes only the cone affected by actual changes |
 //! | [`BatchEngine`] | 64 independent instances bit-packed per word (SWAR) |
+//! | [`PackedEngine`] | one instance bit-packed: up to 64 same-op gates per word op |
 //! | [`JitEngine`] | tick compiled to native code via Cranelift |
 //! | [`ThreadedEngine`] | level-parallel work distribution via rayon |
-//! | [`HybridEngine`] | SWAR × rayon × JIT; fastest plan picked by on-circuit measurement |
+//! | [`HybridEngine`] | every technique above; fastest plan picked by on-circuit measurement |
 
 mod batch;
 pub mod compile;
@@ -28,6 +29,7 @@ mod event;
 mod hybrid;
 #[cfg(feature = "jit")]
 mod jit;
+mod pack;
 mod scalar;
 #[cfg(feature = "rayon")]
 mod threaded;
@@ -39,6 +41,7 @@ pub use event::EventEngine;
 pub use hybrid::{HybridEngine, Strategy};
 #[cfg(feature = "jit")]
 pub use jit::JitEngine;
+pub use pack::PackedEngine;
 pub use scalar::ScalarEngine;
 #[cfg(feature = "rayon")]
 pub use threaded::ThreadedEngine;

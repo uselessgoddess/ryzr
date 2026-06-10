@@ -2,7 +2,7 @@
 //! outputs to the `ryzr-core` reference interpreter, on every tick, for
 //! randomly generated sequential circuits and random input sequences.
 
-use ryzr_backend::{BatchEngine, Engine, EventEngine, ScalarEngine};
+use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
 use ryzr_core::{Backend, Circuit, CircuitBuilder, Interpreter, Signal};
 
 #[cfg(feature = "jit")]
@@ -122,6 +122,7 @@ fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
         Box::new(ScalarEngine::new(circuit)),
         Box::new(EventEngine::new(circuit)),
         Box::new(BatchEngine::new(circuit)),
+        Box::new(PackedEngine::new(circuit)),
         #[cfg(feature = "rayon")]
         Box::new(ThreadedEngine::new(circuit).with_threshold(4)),
         #[cfg(feature = "jit")]

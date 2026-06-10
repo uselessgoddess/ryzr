@@ -3,7 +3,8 @@
 //! 32 registers) must match bit for bit, on every engine.
 
 use ryzr_backend::{
-    BatchEngine, Engine, EventEngine, HybridEngine, JitEngine, ScalarEngine, ThreadedEngine,
+    BatchEngine, Engine, EventEngine, HybridEngine, JitEngine, PackedEngine, ScalarEngine,
+    ThreadedEngine,
 };
 use ryzr_core::Circuit;
 use ryzr_riscv::{Emulator, build_cpu, programs};
@@ -13,6 +14,7 @@ fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
         Box::new(ScalarEngine::new(circuit)),
         Box::new(EventEngine::new(circuit)),
         Box::new(BatchEngine::new(circuit)),
+        Box::new(PackedEngine::new(circuit)),
         Box::new(ThreadedEngine::new(circuit).with_threshold(64)),
         Box::new(JitEngine::new(circuit)),
         // Threshold 64 exercises the parallel path on the CPU's wide levels.
