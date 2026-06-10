@@ -2,6 +2,8 @@
 //! core. One engine tick retires one instruction, so the throughput numbers
 //! are directly in instructions/sec.
 
+use std::hint::black_box;
+
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ryzr_backend::{
     BatchEngine, Engine, EventEngine, HybridEngine, JitEngine, PackedEngine, ScalarEngine,
@@ -9,7 +11,6 @@ use ryzr_backend::{
 };
 use ryzr_core::Circuit;
 use ryzr_riscv::{build_cpu, programs};
-use std::hint::black_box;
 
 fn engines(circuit: &Circuit) -> Vec<Box<dyn Engine>> {
     vec![

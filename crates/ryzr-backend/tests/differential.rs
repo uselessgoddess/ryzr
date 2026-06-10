@@ -2,15 +2,14 @@
 //! outputs to the `ryzr-core` reference interpreter, on every tick, for
 //! randomly generated sequential circuits and random input sequences.
 
-use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
-use ryzr_core::{Backend, Circuit, CircuitBuilder, Interpreter, Signal};
-
 #[cfg(feature = "jit")]
 use ryzr_backend::JitEngine;
 #[cfg(feature = "rayon")]
 use ryzr_backend::ThreadedEngine;
+use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
 #[cfg(all(feature = "jit", feature = "rayon"))]
 use ryzr_backend::{Compiled, HybridEngine, Strategy};
+use ryzr_core::{Backend, Circuit, CircuitBuilder, Interpreter, Signal};
 
 /// Deterministic xorshift64* PRNG — no rand dependency, reproducible cases.
 struct Rng(u64);

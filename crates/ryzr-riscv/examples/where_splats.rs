@@ -103,7 +103,10 @@ fn main() {
         }
     }
 
-    println!("{:>10} {:>4} {:>8} {:>7} {:>8} {:>8} {:>8}", "class", "op", "windows", "gates", "funnels", "splats", "selU");
+    println!(
+        "{:>10} {:>4} {:>8} {:>7} {:>8} {:>8} {:>8}",
+        "class", "op", "windows", "gates", "funnels", "splats", "selU"
+    );
     let mut tot = Bucket::default();
     for ((class, op), b) in &by_class {
         println!(

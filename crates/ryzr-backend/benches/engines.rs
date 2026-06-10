@@ -1,15 +1,14 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
-use ryzr_core::{Circuit, CircuitBuilder};
-
 #[cfg(all(feature = "jit", feature = "rayon"))]
 use ryzr_backend::HybridEngine;
 #[cfg(feature = "jit")]
 use ryzr_backend::JitEngine;
 #[cfg(feature = "rayon")]
 use ryzr_backend::ThreadedEngine;
+use ryzr_backend::{BatchEngine, Engine, EventEngine, PackedEngine, ScalarEngine};
+use ryzr_core::{Circuit, CircuitBuilder};
 
 /// N-bit register counter with real feedback: bit[i] <= bit[i] ^ carry[i].
 /// Wide and shallow; activity is low (a counter flips ~2 bits per tick on

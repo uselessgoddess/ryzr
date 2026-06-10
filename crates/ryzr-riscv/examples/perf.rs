@@ -3,9 +3,10 @@
 //! Criterion's `riscv` bench is the rigorous version; this is the fast
 //! inner loop for development.
 
+use std::time::Instant;
+
 use ryzr_backend::{Engine, EventEngine, HybridEngine, JitEngine, PackedEngine, ScalarEngine};
 use ryzr_riscv::{build_cpu, programs};
-use std::time::Instant;
 
 fn main() {
     let circuit = build_cpu(&programs::fib_forever(), 256);
