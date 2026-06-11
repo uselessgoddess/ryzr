@@ -607,6 +607,87 @@ impl Plan {
     }
 }
 
+/// Temporary profiling hook: per-tick work census of the packed plan.
+#[doc(hidden)]
+pub fn plan_report(tape: &Compiled) -> String {
+    let mut out = String::new();
+
+    // What structural fusion caught.
+    let (chains, mut fused) = find_chains(tape);
+    let banks = find_banks(tape);
+    out.push_str(&format!("fused carry chains: {}\n", chains.len()));
+    out.push_str(&format!("fused RAM banks: {}\n", banks.len()));
+    for b in &banks {
+        out.push_str(&format!("  bank: {} words x {} bits\n", b.words, b.width));
+        for &slot in &b.fused {
+            fused[slot as usize] = true;
+        }
+    }
+    // Remaining (unfused) muxes by level — the read trees fusion missed.
+    let mut mux_by_level = std::collections::BTreeMap::<u32, usize>::new();
+    for s in tape.gate_start as usize..tape.slot_count() {
+        if tape.ops[s] == Op::Mux && !fused[s] {
+            *mux_by_level.entry(tape.slot_level[s]).or_default() += 1;
+        }
+    }
+    let total_unfused_mux: usize = mux_by_level.values().sum();
+    out.push_str(&format!("unfused muxes (gate level): {total_unfused_mux}\n"));
+    for (lvl, n) in &mux_by_level {
+        if *n >= 16 {
+            out.push_str(&format!("  level {lvl:>3}: {n} muxes\n"));
+        }
+    }
+    out.push('\n');
+
+    let plan = Plan::new(tape);
+    let mut by_op = std::collections::BTreeMap::<&str, usize>::new();
+    let mut splat_by_op = std::collections::BTreeMap::<&str, usize>::new();
+    let mut funnels = 0usize;
+    let mut splats = 0usize;
+    for t in &plan.tasks {
+        let name = match t.op {
+            TaskOp::Gate(Op::And) => "and",
+            TaskOp::Gate(Op::Or) => "or",
+            TaskOp::Gate(Op::Xor) => "xor",
+            TaskOp::Gate(Op::Nand) => "nand",
+            TaskOp::Gate(Op::Nor) => "nor",
+            TaskOp::Gate(Op::Xnor) => "xnor",
+            TaskOp::Gate(Op::Not) => "not",
+            TaskOp::Gate(Op::Buf) => "buf",
+            TaskOp::Gate(Op::Mux) => "mux",
+            TaskOp::Add => "add(fused)",
+            TaskOp::MemRead(_) => "memread",
+        };
+        *by_op.entry(name).or_default() += 1;
+        for s in &t.streams {
+            funnels += s.funnels as usize;
+            splats += s.splats as usize;
+            *splat_by_op.entry(name).or_default() += s.splats as usize;
+        }
+    }
+    let cap_funnels: usize = plan.capture.iter().map(|(_, s)| s.funnels as usize).sum();
+    let cap_splats: usize = plan.capture.iter().map(|(_, s)| s.splats as usize).sum();
+    out.push_str(&format!("arena words: {} ({} KB)\n", plan.words, plan.words * 8 / 1024));
+    out.push_str(&format!("tasks: {}\n", plan.tasks.len()));
+    for (k, v) in &by_op {
+        out.push_str(&format!(
+            "  {k:12} {v:>4}  ({} splats)\n",
+            splat_by_op.get(k).copied().unwrap_or(0)
+        ));
+    }
+    out.push_str(&format!("settle segs: {funnels} funnels + {splats} splats\n"));
+    out.push_str(&format!(
+        "capture: {} words, {cap_funnels} funnels + {cap_splats} splats\n",
+        plan.capture.len()
+    ));
+    out.push_str(&format!(
+        "mem_reads: {}, mem_writes: {}\n",
+        plan.mem_reads.len(),
+        plan.mem_writes.len()
+    ));
+    out
+}
+
 impl PackedEngine {
     pub fn new(circuit: &ryzr_core::Circuit) -> Self {
         Self::with_tape(&Compiled::new(circuit))

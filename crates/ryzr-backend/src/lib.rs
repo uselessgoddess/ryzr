@@ -43,6 +43,8 @@ pub use event::EventEngine;
 #[cfg(all(feature = "jit", feature = "rayon"))]
 pub use hybrid::HybridEngine;
 pub use pack::PackedEngine;
+#[doc(hidden)]
+pub use pack::plan_report;
 #[cfg(feature = "jit")]
 pub use pack_jit::PackedJitEngine;
 pub use scalar::ScalarEngine;
