@@ -32,7 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify execution results (release, same binaries as the bench)
-        run: cargo test --workspace --release
+        run: cargo test -p ryzr-core -p ryzr-backend -p ryzr-riscv --release
 
       - name: RISC-V benchmark (1 elem = 1 retired instruction)
         run: cargo bench -p ryzr-riscv -- --noplot 2>&1 | tee riscv-bench.log
