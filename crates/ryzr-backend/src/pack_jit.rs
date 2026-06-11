@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value, types};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -242,7 +243,19 @@ impl PackedJitEngine {
                     TaskOp::MemRead(m) => {
                         let mr = &plan.mem_reads[m as usize];
                         let addr = emit.assemble_addr(&mr.addr_pos);
-                        let prod = emit.fb.ins().imul_imm(addr, i64::from(mr.width));
+                        // Register file: read index `addr - (addr != 0)` so the
+                        // hardwired-zero word 0 reads stored word 1 (never out
+                        // of bounds) and is masked to zero below.
+                        let (idx, zmask) = if mr.zero_word0 {
+                            let nzb = emit.fb.ins().icmp_imm(IntCC::NotEqual, addr, 0);
+                            let nz = emit.fb.ins().uextend(types::I64, nzb);
+                            let idx = emit.fb.ins().isub(addr, nz);
+                            // ineg(1) = !0 (keep), ineg(0) = 0 (zero the read).
+                            (idx, Some(emit.fb.ins().ineg(nz)))
+                        } else {
+                            (addr, None)
+                        };
+                        let prod = emit.fb.ins().imul_imm(idx, i64::from(mr.width));
                         let srcb = emit.fb.ins().iadd_imm(prod, i64::from(mr.base_bit));
                         let word = emit.fb.ins().ushr_imm(srcb, 6); // / 64
                         let o = emit.fb.ins().band_imm(srcb, 63); // % 64
@@ -257,7 +270,11 @@ impl PackedJitEngine {
                         let h0 = emit.fb.ins().ishl(hi, s63);
                         let h = emit.fb.ins().ishl_imm(h0, 1);
                         let merged = emit.fb.ins().bor(l, h);
-                        emit.fb.ins().band_imm(merged, ones(mr.width as usize) as i64)
+                        let masked = emit.fb.ins().band_imm(merged, ones(mr.width as usize) as i64);
+                        match zmask {
+                            Some(z) => emit.fb.ins().band(masked, z),
+                            None => masked,
+                        }
                     }
                 };
                 emit.fb.ins().store(MemFlags::trusted(), word, emit.base, (task.dst as i32) * 8);
