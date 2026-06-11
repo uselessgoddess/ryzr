@@ -286,6 +286,78 @@ fn fused_wide_counter_matches_oracle() {
     }
 }
 
+/// A gate-level single-port RAM in the exact idiom the packed planner fuses:
+/// a balanced read mux-tree and a one-hot-decoded write port over a register
+/// array. `words` must be a power of two. Inputs: `k` address bits, `width`
+/// data bits, one write-enable; outputs: the `width` read-port bits followed
+/// by every cell so a fusion bug anywhere is observed.
+fn ram_circuit(words: usize, width: usize) -> Circuit {
+    // Balanced read mux-tree per bit: leaves are the cell outputs, the
+    // per-level select is the address bit (LSB at the bottom).
+    fn read_tree(b: &mut CircuitBuilder, leaves: &[Signal], addr: &[Signal]) -> Signal {
+        if leaves.len() == 1 {
+            return leaves[0];
+        }
+        let half = leaves.len() / 2;
+        let msb = addr.len() - 1;
+        let lo = read_tree(b, &leaves[..half], &addr[..msb]);
+        let hi = read_tree(b, &leaves[half..], &addr[..msb]);
+        b.mux(addr[msb], hi, lo)
+    }
+
+    let mut b = CircuitBuilder::new();
+    let k = words.trailing_zeros() as usize;
+
+    let addr: Vec<Signal> = (0..k).map(|j| b.input(format!("A{j}"))).collect();
+    let data: Vec<Signal> = (0..width).map(|i| b.input(format!("D{i}"))).collect();
+    let we = b.input("WE");
+
+    // Cells in word-major order: cell (w, i) is register w * width + i.
+    let cells: Vec<Vec<(_, Signal)>> = (0..words)
+        .map(|w| (0..width).map(|i| b.reg(format!("C{w}_{i}"), false)).collect())
+        .collect();
+
+    // Per-word one-hot decoder and write port: reg_in = mux(and(WE, dec), data, self).
+    for (w, row) in cells.iter().enumerate() {
+        let mut dec = if w & 1 == 1 { addr[0] } else { b.not(addr[0]) };
+        for (j, &a) in addr.iter().enumerate().skip(1) {
+            let lit = if (w >> j) & 1 == 1 { a } else { b.not(a) };
+            dec = b.and(dec, lit);
+        }
+        let we_w = b.and(we, dec);
+        for (i, &(reg, out)) in row.iter().enumerate() {
+            let next = b.mux(we_w, data[i], out);
+            b.drive(reg, next);
+        }
+    }
+
+    for i in 0..width {
+        let column: Vec<Signal> = cells.iter().map(|row| row[i].1).collect();
+        let read = read_tree(&mut b, &column, &addr);
+        b.output(format!("READ{i}"), read);
+    }
+    for (w, row) in cells.iter().enumerate() {
+        for (i, &(_, out)) in row.iter().enumerate() {
+            b.output(format!("CELL{w}_{i}"), out);
+        }
+    }
+
+    b.finish().unwrap()
+}
+
+#[test]
+fn fused_ram_matches_oracle() {
+    // Two fusable shapes (>= the 16-word fusion floor) plus a 4-word bank
+    // that stays below it, so both the fused and unfused paths are checked.
+    for &(words, width) in &[(16usize, 8usize), (64, 32), (4, 4)] {
+        let circuit = ram_circuit(words, width);
+        for mut engine in engines(&circuit) {
+            let mut io_rng = Rng(0x5EED_0A11_u64.wrapping_mul(words as u64 + 1) ^ width as u64);
+            check_engine(&circuit, engine.as_mut(), &mut io_rng, 200);
+        }
+    }
+}
+
 #[test]
 fn batch_lanes_are_independent() {
     // An adder-like circuit; each lane gets different inputs and must

@@ -121,6 +121,27 @@ impl Emit<'_> {
         }
         acc.unwrap_or_else(|| self.fb.ins().iconst(types::I64, 0))
     }
+
+    /// Load arena bit `p` as a 0/1 valued `i64`.
+    fn bit_at(&mut self, p: u32) -> Value {
+        let w = self.word(p >> 6);
+        let s = self.fb.ins().ushr_imm(w, i64::from(p & 63));
+        self.fb.ins().band_imm(s, 1)
+    }
+
+    /// Assemble an address word from arena bit positions, least significant
+    /// first: `sum_j bit(positions[j]) << j`.
+    fn assemble_addr(&mut self, positions: &[u32]) -> Value {
+        let mut addr = self.fb.ins().iconst(types::I64, 0);
+        for (j, &p) in positions.iter().enumerate() {
+            let mut bit = self.bit_at(p);
+            if j != 0 {
+                bit = self.fb.ins().ishl_imm(bit, j as i64);
+            }
+            addr = self.fb.ins().bor(addr, bit);
+        }
+        addr
+    }
 }
 
 /// Advance `cursor` past the next `n` segments and return them.
@@ -128,6 +149,11 @@ fn take<'s>(cursor: &mut &'s [Seg], n: usize) -> &'s [Seg] {
     let (head, rest) = cursor.split_at(n);
     *cursor = rest;
     head
+}
+
+/// Low `len` bits set (`len <= 64`).
+fn ones(len: usize) -> u64 {
+    if len >= 64 { !0 } else { (1u64 << len) - 1 }
 }
 
 impl PackedJitEngine {
@@ -210,6 +236,29 @@ impl PackedJitEngine {
                         let ab = emit.fb.ins().iadd(a, b);
                         emit.fb.ins().iadd(ab, c)
                     }
+                    // Fused RAM read: assemble the address, then a single
+                    // dynamic-index funnel load pulls `bank[addr]` out of the
+                    // register-output region.
+                    TaskOp::MemRead(m) => {
+                        let mr = &plan.mem_reads[m as usize];
+                        let addr = emit.assemble_addr(&mr.addr_pos);
+                        let prod = emit.fb.ins().imul_imm(addr, i64::from(mr.width));
+                        let srcb = emit.fb.ins().iadd_imm(prod, i64::from(mr.base_bit));
+                        let word = emit.fb.ins().ushr_imm(srcb, 6); // / 64
+                        let o = emit.fb.ins().band_imm(srcb, 63); // % 64
+                        let woff = emit.fb.ins().ishl_imm(word, 3); // word * 8 bytes
+                        let ptr = emit.fb.ins().iadd(emit.base, woff);
+                        let lo = emit.fb.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
+                        let hi = emit.fb.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
+                        // Branchless funnel for a runtime offset: at o == 0
+                        // the high half `(hi << 63) << 1` shifts out entirely.
+                        let l = emit.fb.ins().ushr(lo, o);
+                        let s63 = emit.fb.ins().irsub_imm(o, 63); // 63 - o
+                        let h0 = emit.fb.ins().ishl(hi, s63);
+                        let h = emit.fb.ins().ishl_imm(h0, 1);
+                        let merged = emit.fb.ins().bor(l, h);
+                        emit.fb.ins().band_imm(merged, ones(mr.width as usize) as i64)
+                    }
                 };
                 emit.fb.ins().store(MemFlags::trusted(), word, emit.base, (task.dst as i32) * 8);
                 emit.cache.insert(task.dst, word);
@@ -225,6 +274,60 @@ impl PackedJitEngine {
                     cap_cursor = rest;
                     let v = emit.gather(head, sr.funnels as usize, imm);
                     emit.fb.ins().store(MemFlags::trusted(), v, staging, (i as i32) * 8);
+                }
+
+                // Fused RAM writes: the capture already held each bank's
+                // contents forward, so a single guarded 128-bit patch (the
+                // field may straddle two staging words) overwrites just the
+                // addressed word when the store-enable is high — exactly
+                // `mux(we_addr, data, self)`, none else.
+                let mut mw_cursor = plan.mem_segs.as_slice();
+                for mw in &plan.mem_writes {
+                    let n = mw.data.funnels as usize + mw.data.splats as usize;
+                    let (head, rest) = mw_cursor.split_at(n);
+                    mw_cursor = rest;
+                    let data = emit.gather(head, mw.data.funnels as usize, mw.data_imm);
+                    let addr = emit.assemble_addr(&mw.addr_pos);
+
+                    // Store-enable broadcast to an all-ones / all-zero mask.
+                    let ew = emit.word(mw.enable_pos >> 6);
+                    let eo = mw.enable_pos & 63;
+                    let parked =
+                        if eo == 63 { ew } else { emit.fb.ins().ishl_imm(ew, i64::from(63 - eo)) };
+                    let cond = emit.fb.ins().sshr_imm(parked, 63);
+
+                    // Destination word + intra-word offset in the staging.
+                    let prod = emit.fb.ins().imul_imm(addr, i64::from(mw.width));
+                    let off = emit.fb.ins().iadd_imm(prod, i64::from(mw.base_bit));
+                    let word = emit.fb.ins().ushr_imm(off, 6);
+                    let sh = emit.fb.ins().band_imm(off, 63);
+                    let woff = emit.fb.ins().ishl_imm(word, 3);
+                    let sptr = emit.fb.ins().iadd(staging, woff);
+                    let lo = emit.fb.ins().load(types::I64, MemFlags::trusted(), sptr, 0);
+                    let hi = emit.fb.ins().load(types::I64, MemFlags::trusted(), sptr, 8);
+
+                    // 128-bit field placement (mirrors `pack::patch`).
+                    let vmask = emit.fb.ins().iconst(types::I64, ones(mw.width as usize) as i64);
+                    let vmask128 = emit.fb.ins().uextend(types::I128, vmask);
+                    let masked_data = emit.fb.ins().band(data, vmask);
+                    let data128 = emit.fb.ins().uextend(types::I128, masked_data);
+                    let placed = emit.fb.ins().ishl(data128, sh);
+                    let pmask = emit.fb.ins().ishl(vmask128, sh);
+                    let cond128 = emit.fb.ins().sextend(types::I128, cond);
+                    let effective = emit.fb.ins().band(pmask, cond128);
+                    let neff = emit.fb.ins().bnot(effective);
+                    let lo128 = emit.fb.ins().uextend(types::I128, lo);
+                    let hi128 = emit.fb.ins().uextend(types::I128, hi);
+                    let hi_shifted = emit.fb.ins().ishl_imm(hi128, 64);
+                    let cur = emit.fb.ins().bor(lo128, hi_shifted);
+                    let kept = emit.fb.ins().band(cur, neff);
+                    let put = emit.fb.ins().band(placed, effective);
+                    let new = emit.fb.ins().bor(kept, put);
+                    let new_lo = emit.fb.ins().ireduce(types::I64, new);
+                    let new_hi_full = emit.fb.ins().ushr_imm(new, 64);
+                    let new_hi = emit.fb.ins().ireduce(types::I64, new_hi_full);
+                    emit.fb.ins().store(MemFlags::trusted(), new_lo, sptr, 0);
+                    emit.fb.ins().store(MemFlags::trusted(), new_hi, sptr, 8);
                 }
             }
 
@@ -253,7 +356,7 @@ impl PackedJitEngine {
 
         let mut engine = Self {
             bits: vec![0; plan.words],
-            staging: vec![0; plan.reg_init.len()],
+            staging: vec![0; plan.staging_words],
             reg_word: plan.reg_word,
             reg_init: plan.reg_init,
             outputs: plan.outputs,
@@ -268,8 +371,10 @@ impl PackedJitEngine {
     /// Restore power-on state: register initials latched, inputs low.
     pub(crate) fn reset(&mut self) {
         self.bits.fill(0);
-        self.staging.copy_from_slice(&self.reg_init);
-        self.bits[self.reg_word..self.reg_word + self.staging.len()].copy_from_slice(&self.staging);
+        self.staging.fill(0);
+        let regs = self.reg_init.len();
+        self.staging[..regs].copy_from_slice(&self.reg_init);
+        self.bits[self.reg_word..self.reg_word + regs].copy_from_slice(&self.reg_init);
     }
 }
 
@@ -304,9 +409,12 @@ impl Engine for PackedJitEngine {
     }
 
     fn tick(&mut self) {
-        // Clock edge: the register region is contiguous and word-aligned,
-        // so applying the captured next-state is a straight word copy.
-        self.bits[self.reg_word..self.reg_word + self.staging.len()].copy_from_slice(&self.staging);
+        // Clock edge: the register region is contiguous and word-aligned, so
+        // applying the captured next-state is a straight word copy. Only the
+        // live-register words copy back; a staging pad word a write patch may
+        // have touched is scratch and stays behind.
+        let regs = self.reg_init.len();
+        self.bits[self.reg_word..self.reg_word + regs].copy_from_slice(&self.staging[..regs]);
 
         let bits = self.bits.as_mut_ptr();
         let staging = self.staging.as_mut_ptr();

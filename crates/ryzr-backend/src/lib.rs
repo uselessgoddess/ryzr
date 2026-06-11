@@ -31,6 +31,7 @@ mod fuse;
 mod hybrid;
 #[cfg(feature = "jit")]
 mod jit;
+mod mem;
 mod pack;
 #[cfg(feature = "jit")]
 mod pack_jit;

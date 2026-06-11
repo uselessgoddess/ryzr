@@ -38,6 +38,7 @@
 use crate::Engine;
 use crate::compile::{Compiled, Op, arity};
 use crate::fuse::{Chain, find_chains};
+use crate::mem::find_banks;
 
 /// Minimum contiguous run length worth a funnel shift; shorter runs join
 /// the splat groups (measured on the RV32I core: 2..=8 are within noise,
@@ -70,6 +71,40 @@ pub(crate) enum TaskOp {
     Gate(Op),
     /// `dst = a + b + c`: sums in bits `0..len`, carry-out at bit `len`.
     Add,
+    /// Fused RAM read: gather `bank[addr]` into `dst` (a fresh word). Indexes
+    /// [`Plan::mem_reads`]; streams are empty.
+    MemRead(u32),
+}
+
+/// A fused single-port RAM read: `dst = bank[addr]`, evaluated as one
+/// dynamic-index funnel load over the bank's register-output region. The
+/// address is assembled from the (already settled) address bits.
+pub(crate) struct MemRead {
+    /// Arena bit positions of the address bits, least significant first.
+    pub(crate) addr_pos: Vec<u32>,
+    /// Arena bit of bank cell `(word 0, bit 0)`.
+    pub(crate) base_bit: u32,
+    /// Bits per word.
+    pub(crate) width: u32,
+    /// Destination arena word for the read result (bit `i` = `bank[addr][i]`).
+    pub(crate) dst: u32,
+}
+
+/// A fused single-port RAM write: `if E { bank[addr] = data }`, applied to
+/// the register staging after the ordinary capture has copied the bank's
+/// current contents forward (the unwritten "hold").
+pub(crate) struct MemWrite {
+    /// Arena bit positions of the address bits, least significant first.
+    pub(crate) addr_pos: Vec<u32>,
+    /// Staging bit of bank cell `(word 0, bit 0)`.
+    pub(crate) base_bit: u32,
+    pub(crate) width: u32,
+    /// Arena bit of the shared store-enable.
+    pub(crate) enable_pos: u32,
+    /// Gather program (in [`Plan::mem_segs`]) producing the `width`-bit data
+    /// word, plus its constant-folded immediate.
+    pub(crate) data: StreamRef,
+    pub(crate) data_imm: u64,
 }
 
 /// One output word: up to 64 same-op gates of one run.
@@ -117,6 +152,36 @@ pub(crate) struct Plan {
     pub(crate) reg_init: Vec<u64>,
     pub(crate) outputs: Vec<OutSrc>,
     pub(crate) input_count: usize,
+    /// Fused RAM reads, indexed by [`TaskOp::MemRead`].
+    pub(crate) mem_reads: Vec<MemRead>,
+    /// Fused RAM writes, applied after the capture in plan order.
+    pub(crate) mem_writes: Vec<MemWrite>,
+    /// Segment pool for the write data gathers, consumed in write order.
+    pub(crate) mem_segs: Vec<Seg>,
+    /// Staging length in words, including the pad word the write patch may
+    /// touch when a bank word straddles a 64-bit boundary. The clock edge
+    /// only copies the first `reg_init.len()` words back into the arena.
+    pub(crate) staging_words: usize,
+}
+
+/// Write a `width`-bit value `val` (low bits) at bit offset `off` of a u64
+/// slice, but only where `cond` is set (`!0` to write, `0` to leave intact).
+/// The field may straddle two words; the higher word is touched only when it
+/// genuinely overlaps, so a non-straddling write at the last live word never
+/// reads past it.
+fn patch(stage: &mut [u64], off: usize, width: usize, val: u64, cond: u64) {
+    let lo = off / 64;
+    let sh = off % 64;
+    let vmask = ones(width) as u128;
+    let placed = ((val as u128) & vmask) << sh;
+    let pmask = vmask << sh;
+    let lo_pm = (pmask as u64) & cond;
+    stage[lo] = (stage[lo] & !lo_pm) | (placed as u64 & lo_pm);
+    let pmask_hi = (pmask >> 64) as u64;
+    if pmask_hi != 0 {
+        let hi_pm = pmask_hi & cond;
+        stage[lo + 1] = (stage[lo + 1] & !hi_pm) | ((placed >> 64) as u64 & hi_pm);
+    }
 }
 
 pub struct PackedEngine {
@@ -232,7 +297,18 @@ impl Plan {
 
         // Recognize ripple-carry adders first: their gates leave the window
         // pipeline entirely and settle as native word adds instead.
-        let (chains, fused) = find_chains(tape);
+        let (chains, mut fused) = find_chains(tape);
+
+        // Recognize single-port RAM banks: the whole read mux-tree and write
+        // mux fabric leaves the pipeline, replaced by a dynamic-index gather
+        // (read) and a copy-and-patch (write). Their muxes are marked fused
+        // so they never occupy a run; the read roots are relocated below.
+        let banks = find_banks(tape);
+        for bank in &banks {
+            for &slot in &bank.fused {
+                fused[slot as usize] = true;
+            }
+        }
 
         // Constant values per slot; u8::MAX = not a constant.
         let mut cval = vec![u8::MAX; n];
@@ -310,6 +386,29 @@ impl Plan {
                 ChainDst { sum, pxq, g }
             })
             .collect();
+
+        // Fused-read destinations: one fresh word per bank holds `bank[addr]`.
+        // The read roots are relocated here so downstream gathers read the
+        // selected word instead of the (now absent) mux-tree tops. By this
+        // point every address-bit and bank-cell slot already has a position.
+        let mem_reads: Vec<MemRead> = banks
+            .iter()
+            .map(|bank| {
+                bit = bit.next_multiple_of(64);
+                let dst = bit / 64;
+                for (i, &top) in bank.read_tops.iter().enumerate() {
+                    pos[top as usize] = bit + i as u32;
+                }
+                bit += bank.width;
+                MemRead {
+                    addr_pos: bank.addr_bits.iter().map(|&s| pos[s as usize]).collect(),
+                    base_bit: pos[tape.reg_out_slots[bank.base_reg as usize] as usize],
+                    width: bank.width,
+                    dst,
+                }
+            })
+            .collect();
+
         let words = bit.div_ceil(64) as usize + 1;
 
         // Lower every 64-gate window of every run to a task, interleaving
@@ -323,6 +422,21 @@ impl Plan {
         let mut chain_order: Vec<usize> = (0..chains.len()).collect();
         chain_order.sort_by_key(|&i| chains[i].ready);
         let mut next_chain = 0usize;
+
+        // Fused reads interleave the same way: emit each at its `read_ready`
+        // level, by which point every address bit has settled, and well
+        // below the levels of anything that consumes the selected word.
+        let mut mem_order: Vec<usize> = (0..banks.len()).collect();
+        mem_order.sort_by_key(|&i| banks[i].read_ready);
+        let mut next_mem = 0usize;
+        let emit_read = |m: usize, tasks: &mut Vec<Task>| {
+            tasks.push(Task {
+                op: TaskOp::MemRead(m as u32),
+                dst: mem_reads[m].dst,
+                streams: [StreamRef::default(); 3],
+                imm: [0; 3],
+            });
+        };
         let emit_chain =
             |chain: &Chain, dst: &ChainDst, tasks: &mut Vec<Task>, segs: &mut Vec<Seg>| {
                 let p: Vec<u32> = chain.links.iter().map(|l| l.p).collect();
@@ -353,6 +467,11 @@ impl Plan {
                 let c = chain_order[next_chain];
                 emit_chain(&chains[c], &chain_dst[c], &mut tasks, &mut segs);
                 next_chain += 1;
+            }
+            while next_mem < mem_order.len() && banks[mem_order[next_mem]].read_ready <= lvl as u32
+            {
+                emit_read(mem_order[next_mem], &mut tasks);
+                next_mem += 1;
             }
             let range = level.run_start as usize..level.run_end as usize;
             for (slots, run) in run_slots[range.clone()].iter().zip(&tape.runs[range]) {
@@ -386,16 +505,55 @@ impl Plan {
             emit_chain(&chains[c], &chain_dst[c], &mut tasks, &mut segs);
             next_chain += 1;
         }
+        while next_mem < mem_order.len() {
+            emit_read(mem_order[next_mem], &mut tasks);
+            next_mem += 1;
+        }
+
+        // Capture sources: each live register's next state, except bank cells
+        // hold their current value (their write muxes are fused away). The
+        // fused write then patches just the addressed word into the staging.
+        let mut cap_src: Vec<u32> = tape.reg_in_slots.clone();
+        for bank in &banks {
+            for cell in 0..bank.words * bank.width {
+                let r = (bank.base_reg + cell) as usize;
+                cap_src[r] = tape.reg_out_slots[r];
+            }
+        }
 
         // Gather program for the register capture: live registers' next
         // states, packed in the same order as the register-output region.
         let mut capture = Vec::new();
         let mut cap_segs = Vec::new();
         for chunk in live.chunks(64) {
-            let window: Vec<u32> = chunk.iter().map(|&r| tape.reg_in_slots[r]).collect();
+            let window: Vec<u32> = chunk.iter().map(|&r| cap_src[r]).collect();
             let (imm, sr) = plan_stream(&window, &pos, &cval, &mut cap_segs);
             capture.push((imm, sr));
         }
+
+        // Fused writes: gather each bank's data bus into a `width`-bit word;
+        // at run time it patches the addressed staging word when the shared
+        // store-enable is high.
+        let mut mem_segs = Vec::new();
+        let mem_writes: Vec<MemWrite> = banks
+            .iter()
+            .map(|bank| {
+                let (data_imm, data) = plan_stream(&bank.data, &pos, &cval, &mut mem_segs);
+                MemWrite {
+                    addr_pos: bank.addr_bits.iter().map(|&s| pos[s as usize]).collect(),
+                    base_bit: pos[tape.reg_out_slots[bank.base_reg as usize] as usize]
+                        - (reg_word * 64) as u32,
+                    width: bank.width,
+                    enable_pos: pos[bank.enable as usize],
+                    data,
+                    data_imm,
+                }
+            })
+            .collect();
+        // One pad word: the JIT's write patch stores the (possibly straddled)
+        // high word unconditionally, so the addressed bank word at the very
+        // top of the staging needs a scratch word above it.
+        let staging_words = live.len().div_ceil(64) + usize::from(!banks.is_empty());
 
         // Diagnostics, default off: RYZR_PACK_STATS=1 prints plan shape.
         if std::env::var_os("RYZR_PACK_STATS").is_some() {
@@ -414,7 +572,7 @@ impl Plan {
 
         // Validate the gather SAFETY contract once, here.
         let limit = (words as u32 - 1) * 64;
-        for seg in segs.iter().chain(&cap_segs) {
+        for seg in segs.iter().chain(&cap_segs).chain(&mem_segs) {
             assert!(seg.src < limit, "gather source out of the arena");
         }
 
@@ -442,6 +600,10 @@ impl Plan {
             reg_init,
             outputs,
             input_count: tape.input_slots.len(),
+            mem_reads,
+            mem_writes,
+            mem_segs,
+            staging_words,
         }
     }
 }
@@ -454,7 +616,7 @@ impl PackedEngine {
     pub fn with_tape(tape: &Compiled) -> Self {
         let plan = Plan::new(tape);
         let mut engine =
-            Self { bits: vec![0; plan.words], staging: vec![0; plan.reg_init.len()], plan };
+            Self { bits: vec![0; plan.words], staging: vec![0; plan.staging_words], plan };
         engine.reset();
         engine
     }
@@ -462,9 +624,11 @@ impl PackedEngine {
     /// Restore power-on state: register initials latched, inputs low.
     pub(crate) fn reset(&mut self) {
         self.bits.fill(0);
-        self.staging.copy_from_slice(&self.plan.reg_init);
-        self.bits[self.plan.reg_word..self.plan.reg_word + self.staging.len()]
-            .copy_from_slice(&self.staging);
+        self.staging.fill(0);
+        let regs = self.plan.reg_init.len();
+        self.staging[..regs].copy_from_slice(&self.plan.reg_init);
+        self.bits[self.plan.reg_word..self.plan.reg_word + regs]
+            .copy_from_slice(&self.plan.reg_init);
     }
 }
 
@@ -499,10 +663,13 @@ impl Engine for PackedEngine {
     }
 
     fn tick(&mut self) {
-        // Clock edge: the register region is contiguous and word-aligned,
-        // so applying the captured next-state is a straight word copy.
-        self.bits[self.plan.reg_word..self.plan.reg_word + self.staging.len()]
-            .copy_from_slice(&self.staging);
+        // Clock edge: the register region is contiguous and word-aligned, so
+        // applying the captured next-state is a straight word copy. Only the
+        // live-register words copy back; any staging pad word the write patch
+        // touched is scratch and stays behind.
+        let regs = self.plan.reg_init.len();
+        self.bits[self.plan.reg_word..self.plan.reg_word + regs]
+            .copy_from_slice(&self.staging[..regs]);
 
         // Combinational settle: tasks are in (level, op) tape order, so
         // every gather reads only already-settled words.
@@ -540,6 +707,22 @@ impl Engine for PackedEngine {
                     let c = gather(&self.bits, sc, fc, task.imm[2]);
                     a.wrapping_add(b).wrapping_add(c)
                 }
+                // Fused RAM read: assemble the address from the settled
+                // address bits, then a single dynamic-index funnel load pulls
+                // `bank[addr]` out of the register-output region.
+                TaskOp::MemRead(m) => {
+                    let mr = &self.plan.mem_reads[m as usize];
+                    let mut addr = 0usize;
+                    for (j, &p) in mr.addr_pos.iter().enumerate() {
+                        addr |= ((self.bits[(p >> 6) as usize] >> (p & 63) & 1) as usize) << j;
+                    }
+                    let src = mr.base_bit as usize + addr * mr.width as usize;
+                    let w = src / 64;
+                    let o = src % 64;
+                    let lo = self.bits[w];
+                    let word = if o == 0 { lo } else { (lo >> o) | (self.bits[w + 1] << (64 - o)) };
+                    word & ones(mr.width as usize)
+                }
             };
             self.bits[task.dst as usize] = word;
         }
@@ -553,6 +736,26 @@ impl Engine for PackedEngine {
             let (head, rest) = cursor.split_at(n);
             cursor = rest;
             self.staging[k] = gather(&self.bits, head, sr.funnels as usize, imm);
+        }
+
+        // Fused RAM writes: the capture already held each bank's contents
+        // forward (cells captured their own outputs), so a single guarded
+        // patch overwrites just the addressed word when the store-enable is
+        // high — exactly `mux(we_r, data, self)` for word `addr`, none else.
+        let mut mcursor = self.plan.mem_segs.as_slice();
+        for mw in &self.plan.mem_writes {
+            let n = mw.data.funnels as usize + mw.data.splats as usize;
+            let (head, rest) = mcursor.split_at(n);
+            mcursor = rest;
+            let mut addr = 0usize;
+            for (j, &p) in mw.addr_pos.iter().enumerate() {
+                addr |= ((self.bits[(p >> 6) as usize] >> (p & 63) & 1) as usize) << j;
+            }
+            let e = self.bits[(mw.enable_pos >> 6) as usize] >> (mw.enable_pos & 63) & 1;
+            let cond = 0u64.wrapping_sub(e);
+            let data = gather(&self.bits, head, mw.data.funnels as usize, mw.data_imm);
+            let off = mw.base_bit as usize + addr * mw.width as usize;
+            patch(&mut self.staging, off, mw.width as usize, data, cond);
         }
     }
 }
