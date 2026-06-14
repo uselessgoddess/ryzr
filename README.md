@@ -15,6 +15,7 @@ results to a naive reference interpreter, and the test suite enforces it.
 | `ryzr-core` | circuit IR, builder, topological sort, reference interpreter (the oracle) |
 | `ryzr-backend` | the single-instance engines, one compiled tape |
 | `ryzr-riscv` | gate-level RV32I core: the honesty benchmark |
+| `ryzr-gui` | Bevy 0.18 VCB-like matrix editor for stepping circuits on the `ryzr` runtime |
 
 ## Engines
 
@@ -129,6 +130,102 @@ and dividing VCB's tick rate by its ticks-per-instruction is the only
 fair conversion. What `ryzr` keeps from VCB is the honesty: every gate is
 computed every tick, nothing is abstracted away.
 
+### Doom-like VCB comparison workload
+
+For issue-to-issue comparisons with ViPeR/VCB, `ryzr-riscv` also includes
+a deterministic RV32I "Doom-like" workload. It is not a renderer shortcut:
+the program retires ordinary instructions for frame, ray, and step loops,
+then leaves the result in architectural registers:
+
+| register | meaning |
+|---|---|
+| `a0` / `x10` | checksum |
+| `a1` / `x11` | completed frames |
+| `a2` / `x12` | completed rays |
+| `a3` / `x13` | synthetic wall-hit count |
+| `a7` / `x17` | done flag |
+
+The benchmark example runs the same instruction stream through every
+`ryzr` engine, prints instructions/s and frames/s, and can emit a
+ViPeR/VCB-compatible VMEM image:
+
+```sh
+cargo run -p ryzr-riscv --release --example doom_bench -- \
+  --frames 180 \
+  --emit-vcbmem target/doom_bench_180.vcbmem
+```
+
+Load the generated `.vcbmem` into the ViPeR/VCB RISC-V ROM path and run
+until `a7 == 1`. The fair comparison target is the printed checksum and
+counter tuple, not host-side drawing. The example also prints ViPeR's
+nominal 7 VCB ticks/instruction cost, so a VCB run can be reported both
+as raw VCB ticks/s and as equivalent retired instructions/s.
+
+## Bevy matrix editor
+
+`ryzr-gui` is a Bevy 0.18 application that opens directly into a VCB-like
+2D component matrix. The board can be edited cell-by-cell with sources,
+clock sources, wires, logic gates, D flip-flops, and LED probes. Every edit
+rebuilds an actual `ryzr-core` circuit, and the simulation panel advances
+that circuit through `ryzr-backend::HybridEngine` one clock cycle at a time
+or at a chosen tick budget. Active cells are highlighted from live engine
+outputs, so the editor is exercising the same runtime path as the backend
+benchmarks rather than a separate toy simulator.
+
+| Idle (paused) demo board | Live simulation (`Run`) |
+| --- | --- |
+| ![editor idle](docs/screenshots/editor-initial.png) | ![editor running](docs/screenshots/editor-running.png) |
+
+The right panel reports the live engine name, tick count, measured
+ticks/second, gate/register/signal counts, every source and LED probe, and
+the normalized ViPeR/VCB clock cost so a board edited here can be compared
+directly against the same circuit in VCB.
+
+```sh
+cargo run -p ryzr-gui --features fast-compile
+```
+
+The `fast-compile` feature enables Bevy's `dynamic_linking` feature for
+shorter edit-run cycles. The root dev profile already strips dependency
+debug info; for more aggressive local Bevy iteration, follow Bevy's setup
+[guide](https://bevy.org/learn/quick-start/getting-started/setup/#enable-fast-compiles-optional)
+for `lld`/`mold` or nightly Cranelift on machines where those tools are
+installed.
+
+Set `RYZR_GUI_AUTORUN=1` to launch the editor with the simulation already
+running (useful for demos and headless screenshots).
+
+## VCB comparison report
+
+Use the same architectural signature on both sides. For the included
+Doom-like workload, `doom_bench` prints the expected `a0` checksum,
+completed frame/ray/hit counters in `a1`/`a2`/`a3`, the `a7` done flag,
+retired instruction count, instructions/s, frames/s, and a VCB VMEM image:
+
+```sh
+cargo run -p ryzr-riscv --release --example doom_bench -- \
+  --frames 180 \
+  --emit-vcbmem target/doom_bench_180.vcbmem
+```
+
+Load the generated `.vcbmem` into the ViPeR/VCB VMEM path and run until
+`a7 == 1`. Record the final `a0`, `a1`, `a2`, `a3`, and `a7` values, plus
+VCB raw ticks or wall-clock time. A correct comparison first checks that
+the signature tuple matches the `ryzr` output; only then compare speed.
+`ryzr` reports one tick as one full CPU clock cycle / retired instruction.
+ViPeR notes use a nominal 7 VCB signal ticks per CPU cycle, so report VCB
+both as raw ticks/s and as equivalent retired instructions/s:
+
+```text
+equivalent_instr_per_sec = completed_instructions / elapsed_seconds
+equivalent_instr_per_sec = raw_vcb_ticks_per_sec / measured_vcb_ticks_per_instruction
+```
+
+For another example program, keep the same structure: define a deterministic
+done condition, write a checksum or signature to registers or memory, emit
+the VMEM image, verify the signature in VCB, then normalize by completed
+instructions rather than by host-side rendering or UI frame rate.
+
 ## Running it
 
 ```sh
@@ -136,6 +233,8 @@ cargo test --workspace            # oracle + differential + RISC-V lockstep
 cargo bench -p ryzr-riscv         # instructions/sec on the gate-level core
 cargo bench -p ryzr-backend       # synthetic microbenchmarks
 cargo run -p ryzr-riscv --release --example stats   # circuit statistics
+cargo run -p ryzr-riscv --release --example doom_bench -- --frames 180
+cargo run -p ryzr-gui --features fast-compile
 ```
 
 `ryzr-backend` features: `jit` and `rayon` are on by default; the crate

@@ -1,0 +1,27 @@
+[package]
+name = "ryzr-gui"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bevy = { version = "0.18.1", default-features = false, features = [
+    "2d_bevy_render",
+    "bevy_winit",
+    "default_app",
+    "default_font",
+    "keyboard",
+    "multi_threaded",
+    "std",
+    "ui_bevy_render",
+    "x11",
+] }
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_warn"] }
+ryzr-backend = { path = "../ryzr-backend" }
+ryzr-core = { path = "../ryzr-core" }
+
+[features]
+default = []
+fast-compile = ["bevy/dynamic_linking"]
+
+[lints]
+workspace = true

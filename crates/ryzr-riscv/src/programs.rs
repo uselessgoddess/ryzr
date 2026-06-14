@@ -40,6 +40,57 @@ pub fn fib_terminating(n: i32) -> Vec<u32> {
     ]
 }
 
+/// Deterministic Doom-like ray workload for cross-runtime comparisons.
+///
+/// The program does not depend on any host-side drawing shortcut. It retires
+/// RV32I instructions that model a tiny raycaster's frame/ray/step loops and
+/// accumulates a reproducible checksum:
+///
+/// - `a0`/`x10`: frame checksum
+/// - `a1`/`x11`: completed frames
+/// - `a2`/`x12`: completed rays
+/// - `a3`/`x13`: synthetic wall-hit count
+/// - `a7`/`x17`: done flag, then the program spins in place
+///
+/// `frames` must fit in an ADDI immediate. Use the `doom_bench` example to
+/// emit the same instruction stream as a VCB `.vcbmem` file.
+pub fn doom_like_benchmark(frames: i32) -> Vec<u32> {
+    assert!((1..=2047).contains(&frames), "frames must be in 1..=2047");
+    vec![
+        addi(10, 0, 0),      //  0: checksum = 0
+        addi(11, 0, 0),      //  4: frame = 0
+        addi(12, 0, 0),      //  8: rays = 0
+        addi(13, 0, 0),      // 12: hits = 0
+        addi(14, 0, frames), // 16: target frames
+        addi(15, 0, 64),     // 20: rays per frame
+        addi(16, 0, 16),     // 24: ray steps
+        addi(5, 0, 0),       // 28: frame_loop: ray = 0
+        addi(6, 0, 0),       // 32: ray_loop: step = 0
+        add(7, 11, 5),       // 36: state = frame + ray
+        xor(7, 7, 10),       // 40: state ^= checksum
+        slli(8, 7, 3),       // 44: step_loop: xorshift-ish ray work
+        xor(7, 7, 8),        // 48
+        srli(8, 7, 5),       // 52
+        xor(7, 7, 8),        // 56
+        andi(8, 7, 15),      // 60: sample synthetic map cell
+        add(9, 5, 6),        // 64
+        andi(9, 9, 7),       // 68
+        bne(8, 9, 8),        // 72: no_hit
+        addi(13, 13, 1),     // 76: hits += 1
+        add(10, 10, 7),      // 80: no_hit: checksum += state
+        xor(10, 10, 5),      // 84: checksum ^= ray
+        addi(6, 6, 1),       // 88: step += 1
+        blt(6, 16, -48),     // 92: step_loop
+        addi(5, 5, 1),       // 96: ray += 1
+        addi(12, 12, 1),     // 100: rays += 1
+        blt(5, 15, -72),     // 104: ray_loop
+        addi(11, 11, 1),     // 108: frame += 1
+        blt(11, 14, -84),    // 112: frame_loop
+        addi(17, 0, 1),      // 116: done = 1
+        jal(0, 0),           // 120: spin
+    ]
+}
+
 /// Every load/store width and sign mode, including a negative byte and a
 /// misaligned-by-design halfword lane.
 pub fn memory_exercise() -> Vec<u32> {

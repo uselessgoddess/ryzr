@@ -80,6 +80,29 @@ fn branch_lockstep() {
     lockstep(&programs::branch_exercise(), 4, 40);
 }
 
+#[test]
+fn doom_like_benchmark_signature() {
+    let program = programs::doom_like_benchmark(3);
+    let mut emu = Emulator::new(&program, 4);
+    let mut retired = 0;
+    while emu.regs[17] == 0 && retired < 100_000 {
+        emu.step();
+        retired += 1;
+    }
+
+    assert_eq!(retired, 38_239);
+    assert_eq!(emu.regs[10], 0xbd14_7121, "a0 checksum");
+    assert_eq!(emu.regs[11], 3, "a1 completed frames");
+    assert_eq!(emu.regs[12], 192, "a2 completed rays");
+    assert_eq!(emu.regs[13], 206, "a3 synthetic hits");
+    assert_eq!(emu.regs[17], 1, "a7 done flag");
+}
+
+#[test]
+fn doom_like_lockstep_prefix() {
+    lockstep(&programs::doom_like_benchmark(2), 4, 400);
+}
+
 /// Architecturally known result computed by the actual gates: fib(20).
 #[test]
 fn fib_20_computes_6765_in_hardware() {
